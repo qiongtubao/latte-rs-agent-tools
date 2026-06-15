@@ -1,0 +1,57 @@
+[package]
+name = "latte-rs-agent-tools"
+version = "0.1.0"
+edition = "2021"
+description = "Tool management implementation for AI agents. Port of latte-ts-agent-tools."
+license = "MIT"
+keywords = ["ai", "tools", "agent", "llm", "tool-use"]
+categories = ["api-bindings", "asynchronous"]
+
+[lib]
+name = "latte_rs_agent_tools"
+path = "src/lib.rs"
+
+[[example]]
+name = "tool_manager_demo"
+path = "examples/tool_manager_demo.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "fs", "signal"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# HTTP
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors
+thiserror = "1"
+
+# Time / Duration
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Glob-style patterns for file search
+glob = "0.3"
+regex = "1"
+
+# Logging facade
+log = "0.4"
+
+# Async-friendly file system operations (re-exported from tokio)
+# Walkdir for directory traversal
+walkdir = "2"
+
+# UUID for tool IDs (small, fast)
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Optional: dev-only nix path handling (path-clean, etc.)
+path-clean = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+serial_test = "3"
