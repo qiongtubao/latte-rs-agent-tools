@@ -51,19 +51,33 @@ fn optional(props: Vec<(&str, PropertyType, &str)>) -> ToolInputSchema {
     }
 }
 
+fn resolve_tool_path(path: &str, ctx: &ToolExecutionContext) -> PathBuf {
+    let path_buf = PathBuf::from(path);
+    if path_buf.is_absolute() {
+        return path_buf;
+    }
+    ctx.metadata
+        .as_ref()
+        .and_then(|m| m.get("cwd"))
+        .and_then(|v| v.as_str())
+        .map(|cwd| PathBuf::from(cwd).join(&path_buf))
+        .unwrap_or(path_buf)
+}
+
 /// Standalone `file.read` tool constructor.
 pub fn file_read_tool() -> Tool {
-    let handler = |input: Value, _ctx: ToolExecutionContext| {
+    let handler = |input: Value, ctx: ToolExecutionContext| {
         async move {
             let path = input
                 .get("path")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| crate::error::ToolError::other("path is required"))?;
+            let path_buf = resolve_tool_path(path, &ctx);
             let max_size = input
                 .get("maxSize")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(10 * 1024 * 1024);
-            let metadata = fs::metadata(path)
+            let metadata = fs::metadata(&path_buf)
                 .await
                 .map_err(|e| crate::error::ToolError::execution_str("file.read", format!("stat: {}", e)))?;
             if !metadata.is_file() {
@@ -76,7 +90,7 @@ pub fn file_read_tool() -> Tool {
                     max_size
                 )));
             }
-            let bytes = fs::read(path).await.map_err(|e| {
+            let bytes = fs::read(&path_buf).await.map_err(|e| {
                 crate::error::ToolError::execution_str("file.read", format!("read: {}", e))
             })?;
             let content = String::from_utf8_lossy(&bytes).to_string();
@@ -179,7 +193,7 @@ fn file_write_tool() -> Tool {
 }
 
 fn file_list_tool() -> Tool {
-    let handler = |input: Value, _ctx: ToolExecutionContext| {
+    let handler = |input: Value, ctx: ToolExecutionContext| {
         async move {
             let path = input
                 .get("path")
@@ -194,7 +208,7 @@ fn file_list_tool() -> Tool {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
-            let root = PathBuf::from(path);
+            let root = resolve_tool_path(path, &ctx);
             if !root.is_dir() {
                 return Err(crate::error::ToolError::other(format!(
                     "Not a directory: {}",
@@ -347,116 +361,6 @@ fn file_delete_tool() -> Tool {
     .build()
 }
 
-fn file_search_tool() -> Tool {
-    let handler = |input: Value, _ctx: ToolExecutionContext| {
-        async move {
-            let path = input
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| crate::error::ToolError::other("path is required"))?;
-            let pattern = input
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| crate::error::ToolError::other("pattern is required"))?;
-            let file_pattern = input.get("filePattern").and_then(|v| v.as_str());
-            let ignore_case = input
-                .get("ignoreCase")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let max_depth = input
-                .get("maxDepth")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(20) as usize;
-
-            let re_pattern = if ignore_case {
-                format!("(?i){}", pattern)
-            } else {
-                pattern.to_string()
-            };
-            let re = regex::Regex::new(&re_pattern)
-                .map_err(|e| crate::error::ToolError::other(format!("invalid regex: {}", e)))?;
-            let glob_re = file_pattern.map(|p| {
-                let escaped = p
-                    .replace('.', "\\.")
-                    .replace('*', ".*")
-                    .replace('?', ".");
-                format!("^{}$", escaped)
-            });
-            let glob = glob_re
-                .as_ref()
-                .and_then(|s| regex::Regex::new(s).ok());
-
-            let root = PathBuf::from(path);
-            let mut files: Vec<PathBuf> = Vec::new();
-            collect_files(&root, max_depth, 0, &mut files);
-            if let Some(glob) = glob.as_ref() {
-                files.retain(|f| {
-                    f.file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| glob.is_match(n))
-                        .unwrap_or(false)
-                });
-            }
-
-            let mut matches: Vec<Value> = Vec::new();
-            for f in &files {
-                let content = match tokio::fs::read_to_string(f).await {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                for (i, line) in content.lines().enumerate() {
-                    if re.is_match(line) {
-                        matches.push(json!({
-                            "file": f.to_string_lossy().to_string(),
-                            "line": i + 1,
-                            "content": line,
-                        }));
-                    }
-                }
-            }
-            Ok(json!({
-                "pattern": pattern,
-                "searchPath": path,
-                "matches": matches,
-                "totalMatches": matches.len(),
-                "filesSearched": files.len(),
-            }))
-        }
-        .boxed()
-    };
-    Tool::builder(
-        "search",
-        "在文件中搜索内容",
-        required(vec![
-            ("pattern", PropertyType::String, "搜索模式"),
-            ("path", PropertyType::String, "搜索路径"),
-        ]),
-        std::sync::Arc::new(handler),
-    )
-    .concurrency_safe(true)
-    .timeout(std::time::Duration::from_secs(60))
-    .build()
-}
-
-fn collect_files(dir: &Path, max_depth: usize, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > max_depth {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') || name == "node_modules" {
-                continue;
-            }
-            collect_files(&path, max_depth, depth + 1, out);
-        } else if path.is_file() {
-            out.push(path);
-        }
-    }
-}
-
 /// The `file` tool package. Mirrors `FileToolsPackage` in TS.
 pub struct FileToolsPackage;
 
@@ -471,14 +375,15 @@ impl FileToolsPackage {
                 separator: '.',
                 auto_prefix: true,
             }),
-            description: Some("文件操作工具：读取、写入、列表、删除、搜索".into()),
+            description: Some("文件操作工具：读取、写入、列表、删除、搜索、查找".into()),
             dependencies: None,
             tools: vec![
                 file_read_tool(),
                 file_write_tool(),
                 file_list_tool(),
                 file_delete_tool(),
-                file_search_tool(),
+                crate::tools::search::file_search_tool(),
+                crate::tools::find::file_find_tool(),
             ],
             on_init: None,
             on_destroy: None,

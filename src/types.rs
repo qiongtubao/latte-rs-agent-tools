@@ -1031,10 +1031,18 @@ pub struct ToolManagerConfig {
     pub priority: Option<PackagePriority>,
 }
 
+/// L2 default: per-tool wall-clock budget for any handler that does not
+/// set its own `.timeout()`. This is the layer below the manager's
+/// `tokio_timeout(60s, ...)` wrapper in `register_delegate_tool`. A 30s
+/// default here silently truncates the specialist turn before the outer
+/// wrapper gets a chance to react. 1500s (25 minutes) matches
+/// `DEFAULT_DELEGATE_TIMEOUT_SECS` so specialist fan-outs
+/// (programmer / architect / etc.) can complete long bash+search+read
+/// sequences without premature aborts.
 impl Default for ToolManagerConfig {
     fn default() -> Self {
         Self {
-            default_timeout: Duration::from_secs(30),
+            default_timeout: Duration::from_secs(1500),
             default_max_retries: 3,
             default_separator: DEFAULT_NAMESPACE_SEPARATOR,
             conflict_strategy: ConflictStrategy::Error,

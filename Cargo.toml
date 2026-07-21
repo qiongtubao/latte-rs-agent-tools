@@ -48,6 +48,14 @@ walkdir = "2"
 # UUID for tool IDs (small, fast)
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Base64 encoder (used by http.fetch to ship binary responses as text)
+base64 = "0.22"
+
+
+# `ignore` (ripgrep 的 gitignore-aware 遍历) + `globset` (`**` 递归 glob 匹配)
+# 一起驱动 `file.find` 工具。
+ignore = "0.4"
+globset = "0.4"
 # Optional: dev-only nix path handling (path-clean, etc.)
 path-clean = "0.1"
 

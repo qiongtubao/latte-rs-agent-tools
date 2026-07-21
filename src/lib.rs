@@ -62,8 +62,9 @@ pub mod prelude {
         ScriptHandlerResolver,
     };
     pub use crate::tools::{
-        builtin_tool_packages, file_read_tool, FileToolsPackage, GitToolsPackage,
-        ShellToolsPackage,
+        builtin_tool_packages, file_find_tool, file_read_tool, file_search_tool, FileToolsPackage,
+        GitToolsPackage, http_fetch_tool, HttpToolsPackage, ShellToolsPackage, todo_tool,
+        TodoToolsPackage,
     };
     pub use crate::types::*;
     pub use crate::utils::{

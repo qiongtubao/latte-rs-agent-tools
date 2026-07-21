@@ -52,6 +52,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Built-in Tool Packages
 
+### HTTP (`HttpToolsPackage`)
+- `http.fetch` — 发起 HTTP/HTTPS 请求，支持 method / headers / body / timeoutMs / maxSize / followRedirects。
+  响应体按 Content-Type 自动选择文本或 base64 编码，超过 maxSize 会被流式截断。
+
+### File (`FileToolsPackage`)
+- `file.read` — 读取文件内容
+- `file.write` — 写入文件内容
+- `file.list` — 列出目录内容
+- `file.delete` — 删除文件或目录
+- `file.search` — 按正则搜索文件内容。支持多目标 (`paths` 数组 / glob 路径)、
+  `i` 大小写不敏感、`gitignore` 尊重、`skip` 按文件分页、`limit` 单文件匹配上限。
+  `path` 和 `ignoreCase` 是旧版字段的别名，向后兼容。
+- `file.find` — 按 glob 模式在目录树下查找文件，支持 `**` 递归、`.gitignore` 尊重、
+  mtime 倒序排序、limit 截断、超时控制。`paths` 是 glob 数组，每个元素可以是
+  字面文件路径、字面目录路径，或带 `*` `?` `**` 的 glob。
 ### Git (`GitToolsPackage`)
 - `git.status` — 获取 git 工作区状态
 - `git.diff` — 查看 git 差异
@@ -60,43 +75,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `git.commit` — 创建 git 提交
 - `git.add` — 添加文件到暂存区
 
-### File (`FileToolsPackage`)
-- `file.read` — 读取文件内容
-- `file.write` — 写入文件内容
-- `file.list` — 列出目录内容
-- `file.delete` — 删除文件或目录
-- `file.search` — 在文件中搜索内容
-
 ### Shell (`ShellToolsPackage`)
 - `shell.exec` — 执行 shell 命令并返回输出
 - `shell.spawn` — 启动进程并流式处理输出
 
-## Configuration API
-
-```rust
-use latte_rs_agent_tools::prelude::*;
-
-// Validate config
-let config = ToolManagerSerializedConfig { /* ... */ };
-let result = ConfigValidatorImpl::new().validate(&config);
-assert!(result.valid);
-
-// Create from config
-let resolver = Arc::new(CompositeHandlerResolver::new(
-    std::time::Duration::from_secs(30),
-));
-let opts = CreateFromConfigOptions {
-    handler_resolver: resolver,
-    validate: true,
-    merge_into: None,
-    config_overrides: None,
-    skip_init_hooks: false,
-};
-let manager = ToolManagerFactory::create_from_config(config, opts).await?;
-
-// Diff two configs
-let diff = ToolManagerFactory::diff_configs(&config_a, &config_b);
-```
+### Todo (`TodoToolsPackage`)
+- `todo` — 管理 todo 列表（原子批量操作）。输入 `currentPhases`（可选）和 `ops`
+  数组，每个 op 支持 `init` / `start` / `done` / `rm` / `drop` / `append` / `view`。
+  整批原子应用，任一 op 报错则状态保持不变；应用后自动规范化
+  （至多一个 in_progress，无 in_progress 时第一个 pending 自动升格）。
 
 ## License
 

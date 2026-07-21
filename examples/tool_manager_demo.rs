@@ -14,9 +14,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_package(FileToolsPackage::new())
         .await?;
     manager
-        .register_package(ShellToolsPackage::new())
+        .register_package(HttpToolsPackage::new())
         .await?;
-
+    manager
+        .register_package(TodoToolsPackage::new())
+        .await?;
     // List all tools
     let names = manager.get_tool_names();
     println!("Registered {} tools:", names.len());
