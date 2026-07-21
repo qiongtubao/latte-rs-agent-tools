@@ -94,7 +94,7 @@ fn shell_exec_tool() -> Tool {
         std::sync::Arc::new(handler),
     )
     .concurrency_safe(false)
-    .timeout(std::time::Duration::from_secs(30))
+    .timeout(std::time::Duration::from_secs(120))
     .build()
 }
 
