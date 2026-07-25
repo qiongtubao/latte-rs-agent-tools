@@ -1,5 +1,8 @@
 //! Built-in tool packages mirroring `latte-ts-agent-tools/src/tools`.
 
+pub mod ast;
+pub mod edit;
+pub mod eval;
 pub mod fetch;
 pub mod file;
 pub mod find;
@@ -10,6 +13,9 @@ pub mod search;
 pub mod shell;
 pub mod todo;
 
+pub use ast::AstToolsPackage;
+pub use edit::EditToolsPackage;
+pub use eval::EvalToolsPackage;
 pub use fetch::{http_fetch_tool, HttpToolsPackage};
 pub use file::{FileToolsPackage, file_read_tool};
 pub use find::file_find_tool;
@@ -25,6 +31,9 @@ use crate::types::ToolPackage;
 /// Aggregate of every built-in package.
 pub fn builtin_tool_packages() -> Vec<ToolPackage> {
     vec![
+        AstToolsPackage::new(),
+        EditToolsPackage::new(),
+        EvalToolsPackage::new(),
         GitToolsPackage::new(),
         FileToolsPackage::new(),
         HttpToolsPackage::new(),

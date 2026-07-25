@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   响应体按 Content-Type 自动选择文本或 base64 编码，超过 maxSize 会被流式截断。
 
 ### File (`FileToolsPackage`)
-- `file.read` — 读取文件内容
+- `file.read` — 读取文件内容，支持行范围选择器（`:N-M`、`:N+count`、`:N`、`:raw`），也支持读取目录列表
 - `file.write` — 写入文件内容
 - `file.list` — 列出目录内容
 - `file.delete` — 删除文件或目录

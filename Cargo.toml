@@ -58,6 +58,8 @@ ignore = "0.4"
 globset = "0.4"
 # Optional: dev-only nix path handling (path-clean, etc.)
 path-clean = "0.1"
+ast-grep-language = "0.45.0"
+ast-grep-core = "0.45.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

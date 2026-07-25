@@ -6,6 +6,9 @@ use std::process::Stdio;
 use futures::FutureExt;
 use serde_json::{json, Value};
 use tokio::process::Command;
+use std::sync::LazyLock;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 
 use crate::types::{PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema, ToolPackage};
 
@@ -107,6 +110,13 @@ fn extract_cd_prefix(command: &str) -> Option<(&str, &str)> {
     Some((path, rest))
 }
 
+
+static BG_JOBS: LazyLock<Mutex<BTreeMap<String, tokio::process::Child>>> =
+    std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// 后台 job 计数器。
+static BG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 fn shell_exec_tool() -> Tool {
     let handler = |input: Value, ctx: ToolExecutionContext| {
         async move {
@@ -139,6 +149,91 @@ fn shell_exec_tool() -> Tool {
                 .and_then(|v| v.as_u64())
                 .unwrap_or_else(default_exec_timeout_ms);
             let env_obj = input.get("env").and_then(|v| v.as_object()).cloned();
+            let stdin_payload = input.get("stdin").and_then(|v| v.as_str()).map(String::from);
+            let is_async = input.get("async").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            // --- 后台执行模式 --------------------------------------------------
+            if is_async {
+                let mut cmd = Command::new("sh");
+                cmd.arg("-c").arg(&command);
+                if let Some(c) = cwd.as_deref() {
+                    cmd.current_dir(c);
+                }
+                if let Some(env) = env_obj {
+                    for (k, v) in env {
+                        if let Some(s) = v.as_str() {
+                            cmd.env(k, s);
+                        }
+                    }
+                }
+                cmd.stdin(Stdio::piped());
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::piped());
+
+                let mut child = cmd
+                    .spawn()
+                    .map_err(|e| crate::error::ToolError::execution("shell.exec", e))?;
+
+                // 写 stdin
+                if let Some(payload) = stdin_payload {
+                    if let Some(stdin) = child.stdin.as_mut() {
+                        let _ = stdin.write_all(payload.as_bytes()).await;
+                        let _ = stdin.shutdown().await;
+                    }
+                }
+
+                let job_id = BG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let job_key = format!("bg-{}", job_id);
+                let mut jobs = BG_JOBS.lock().await;
+                jobs.insert(job_key.clone(), child);
+
+                return Ok(json!({
+                    "jobId": job_key,
+                    "status": "running",
+                    "message": format!("Background job {} started. Use shell.exec with `jobId: \"{}\"` and `wait: true` to get the result.", job_key, job_key),
+                }));
+            }
+
+            // --- 等待后台 job --------------------------------------------------
+            let is_wait = input.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
+            if is_wait {
+                let job_id = input
+                    .get("jobId")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| crate::error::ToolError::other("jobId is required when wait=true"))?;
+
+                let mut jobs = BG_JOBS.lock().await;
+                let mut child = jobs
+                    .remove(job_id)
+                    .ok_or_else(|| crate::error::ToolError::other(format!("Job not found: {}", job_id)))?;
+                drop(jobs);
+
+                let output = tokio::time::timeout(
+                    std::time::Duration::from_millis(timeout_ms),
+                    child.wait_with_output(),
+                )
+                .await
+                .map_err(|_| {
+                    crate::error::ToolError::timeout(
+                        "shell.exec",
+                        std::time::Duration::from_millis(timeout_ms),
+                    )
+                })?
+                .map_err(|e| crate::error::ToolError::execution("shell.exec", e))?;
+
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let success = output.status.success();
+                return Ok(json!({
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "exitCode": output.status.code(),
+                    "success": success,
+                    "jobId": job_id,
+                }));
+            }
+
+            // --- 前台执行模式（默认）-------------------------------------------
             let mut cmd = Command::new("sh");
             cmd.arg("-c").arg(&command);
             if let Some(c) = cwd.as_deref() {
@@ -151,10 +246,25 @@ fn shell_exec_tool() -> Tool {
                     }
                 }
             }
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            cmd.stdin(Stdio::piped());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| crate::error::ToolError::execution("shell.exec", e))?;
+
+            // 写 stdin
+            if let Some(payload) = stdin_payload {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(payload.as_bytes()).await;
+                    let _ = stdin.shutdown().await;
+                }
+            }
+
             let output = tokio::time::timeout(
                 std::time::Duration::from_millis(timeout_ms),
-                cmd.output(),
+                child.wait_with_output(),
             )
             .await
             .map_err(|_| {
@@ -164,6 +274,7 @@ fn shell_exec_tool() -> Tool {
                 )
             })?
             .map_err(|e| crate::error::ToolError::execution("shell.exec", e))?;
+
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let success = output.status.success();
@@ -178,21 +289,17 @@ fn shell_exec_tool() -> Tool {
     };
     Tool::builder(
         "exec",
-        "执行 shell 命令并返回输出。L1 默认 timeout 300s（5分钟），可通过 env LATTE_AGENT_BASH_TIMEOUT_SECS 或参数 `timeout` 覆盖。传 cwd 字段修改工作目录，或在 command 里写 `cd X && cmd` 会被自动提取为 cwd。",
+        "执行 shell 命令并返回输出。支持前台执行（默认）和后台执行（`async: true` 返回 jobId，之后用 `wait: true` + `jobId` 取结果）。支持 `stdin` 输入。支持 `cwd`、`timeout`、`env` 参数。",
         schema_with_optional(
             vec![("command", PropertyType::String, "要执行的命令")],
             vec![
                 ("cwd", PropertyType::String, "工作目录。可选。如果 command 以 `cd X &&` 开头，会被自动提取。"),
-                (
-                    "timeout",
-                    PropertyType::Number,
-                    "超时（秒），默认 300s (L1)。命令超过这个时间会被 kill 掉。",
-                ),
-                (
-                    "env",
-                    PropertyType::Object,
-                    "额外的环境变量（key=value 字符串映射）",
-                ),
+                ("timeout", PropertyType::Number, "超时（秒），默认 300s (L1)。命令超过这个时间会被 kill 掉。"),
+                ("env", PropertyType::Object, "额外的环境变量（key=value 字符串映射）"),
+                ("stdin", PropertyType::String, "标准输入内容（可选）"),
+                ("async", PropertyType::Boolean, "后台执行模式。设为 true 立即返回 jobId，不等待命令完成。"),
+                ("wait", PropertyType::Boolean, "等待后台 job 完成。需要配合 `jobId` 使用。"),
+                ("jobId", PropertyType::String, "后台 job ID。wait=true 时必填，指定要等待的 job。"),
             ],
         ),
         std::sync::Arc::new(handler),

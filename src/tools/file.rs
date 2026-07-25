@@ -9,6 +9,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use crate::types::{PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema, ToolPackage};
+use crate::error::ToolError;
 
 fn prop(ty: PropertyType, description: &str) -> ToolInputProperty {
     ToolInputProperty {
@@ -64,62 +65,106 @@ fn resolve_tool_path(path: &str, ctx: &ToolExecutionContext) -> PathBuf {
         .unwrap_or(path_buf)
 }
 
+/// 解析 path 中的行范围选择器。
+/// 格式：`:N-M`、`:raw`、`:N`、`:N+count`。
+fn parse_path_selector(path: &str) -> (&str, Option<&str>) {
+    if let Some(pos) = path.rfind(':') {
+        let after_colon = &path[pos + 1..];
+        if after_colon.starts_with('\\') {
+            return (path, None);
+        }
+        let before = &path[..pos];
+        if before.is_empty() {
+            return (path, None);
+        }
+        if after_colon == "raw"
+            || after_colon == "conflicts"
+            || after_colon.chars().all(|c| c.is_ascii_digit() || c == '-' || c == '+' || c == ',')
+        {
+            return (before, Some(after_colon));
+        }
+    }
+    (path, None)
+}
+
+/// 解析行范围选择器，返回 (start, end) 1-indexed inclusive。
+fn parse_line_range(sel: &str) -> Result<(usize, usize), ToolError> {
+    if let Some(plus_pos) = sel.find('+') {
+        let start: usize = sel[..plus_pos].parse().map_err(|_| ToolError::other(format!("invalid selector: {}", sel)))?;
+        let count: usize = sel[plus_pos + 1..].parse().map_err(|_| ToolError::other(format!("invalid selector: {}", sel)))?;
+        if start < 1 { return Err(ToolError::other("start line must be >= 1")); }
+        if count < 1 { return Err(ToolError::other("count must be >= 1")); }
+        return Ok((start, start + count - 1));
+    }
+    if let Some(dash_pos) = sel.find('-') {
+        let start: usize = sel[..dash_pos].parse().map_err(|_| ToolError::other(format!("invalid selector: {}", sel)))?;
+        let end: usize = sel[dash_pos + 1..].parse().map_err(|_| ToolError::other(format!("invalid selector: {}", sel)))?;
+        if start < 1 || end < 1 { return Err(ToolError::other("line numbers must be >= 1")); }
+        if end < start { return Err(ToolError::other("end line must be >= start line")); }
+        return Ok((start, end));
+    }
+    let line: usize = sel.parse().map_err(|_| ToolError::other(format!("invalid selector: {}", sel)))?;
+    if line < 1 { return Err(ToolError::other("line number must be >= 1")); }
+    Ok((line, line))
+}
+
+/// 列出目录内容。
+async fn list_directory(dir: &std::path::Path, path_str: &str) -> Result<Value, ToolError> {
+    let mut entries: Vec<String> = Vec::new();
+    let mut rd = fs::read_dir(dir).await.map_err(|e| ToolError::execution_str("file.read", e.to_string()))?;
+    while let Some(entry) = rd.next_entry().await.map_err(|e| ToolError::execution_str("file.read", e.to_string()))? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_dir = entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false);
+        if is_dir { entries.push(format!("{}/", name)); } else { entries.push(name); }
+    }
+    entries.sort();
+    Ok(json!({"path": path_str, "isDirectory": true, "entries": entries, "entryCount": entries.len()}))
+}
+
+/// 读取文件，支持选择器。
+async fn read_file_sel(path_buf: &std::path::Path, selector: Option<&str>, max_size: u64) -> Result<Value, ToolError> {
+    let meta = fs::metadata(path_buf).await.map_err(|e| ToolError::execution_str("file.read", format!("stat: {}", e)))?;
+    if !meta.is_file() { return Err(ToolError::other(format!("Not a file: {}", path_buf.display()))); }
+    if meta.len() > max_size { return Err(ToolError::other(format!("File too large: {} > {}", meta.len(), max_size))); }
+    let bytes = fs::read(path_buf).await.map_err(|e| ToolError::execution_str("file.read", format!("read: {}", e)))?;
+    let total_bytes = bytes.len() as u64;
+    let content = String::from_utf8_lossy(&bytes).to_string();
+    let total_lines = content.lines().count();
+    let modified = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(0);
+
+    if let Some(sel) = selector {
+        if sel == "raw" {
+            return Ok(json!({"content": content, "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "encoding": "utf-8", "modifiedAt": modified, "selector": "raw"}));
+        }
+        let (start_line, end_line) = parse_line_range(sel)?;
+        if start_line > total_lines { return Err(ToolError::other(format!("start_line {} exceeds file length {}", start_line, total_lines))); }
+        let end = end_line.min(total_lines);
+        let selected: Vec<&str> = content.lines().skip(start_line - 1).take(end - start_line + 1).collect();
+        let selected_content = selected.join("\n");
+        let numbered: Vec<String> = selected.iter().enumerate().map(|(i, l)| format!("{}:{}", start_line + i, l)).collect();
+        return Ok(json!({"content": selected_content, "numberedContent": numbered.join("\n"), "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "startLine": start_line, "endLine": end, "selectedLines": selected.len(), "encoding": "utf-8", "modifiedAt": modified, "selector": sel}));
+    }
+    Ok(json!({"content": content, "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "encoding": "utf-8", "modifiedAt": modified}))
+}
+
 /// Standalone `file.read` tool constructor.
 pub fn file_read_tool() -> Tool {
     let handler = |input: Value, ctx: ToolExecutionContext| {
         async move {
-            let path = input
-                .get("path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| crate::error::ToolError::other("path is required"))?;
-            let path_buf = resolve_tool_path(path, &ctx);
-            let max_size = input
-                .get("maxSize")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10 * 1024 * 1024);
-            let metadata = fs::metadata(&path_buf)
-                .await
-                .map_err(|e| crate::error::ToolError::execution_str("file.read", format!("stat: {}", e)))?;
-            if !metadata.is_file() {
-                return Err(crate::error::ToolError::other(format!("Not a file: {}", path)));
-            }
-            if metadata.len() > max_size {
-                return Err(crate::error::ToolError::other(format!(
-                    "File too large: {} > {}",
-                    metadata.len(),
-                    max_size
-                )));
-            }
-            let bytes = fs::read(&path_buf).await.map_err(|e| {
-                crate::error::ToolError::execution_str("file.read", format!("read: {}", e))
-            })?;
-            let content = String::from_utf8_lossy(&bytes).to_string();
-            let size = bytes.len() as u64;
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            Ok(json!({
-                "content": content,
-                "path": path,
-                "size": size,
-                "encoding": "utf-8",
-                "modifiedAt": modified,
-            }))
-        }
-        .boxed()
+            let path = input.get("path").and_then(|v| v.as_str()).ok_or_else(|| ToolError::other("path is required"))?;
+            let max_size = input.get("maxSize").and_then(|v| v.as_u64()).unwrap_or(10 * 1024 * 1024);
+            let (file_path, selector) = parse_path_selector(path);
+            let path_buf = resolve_tool_path(file_path, &ctx);
+            let meta = fs::metadata(&path_buf).await.map_err(|e| ToolError::execution_str("file.read", format!("stat: {}", e)))?;
+            if meta.is_dir() { return list_directory(&path_buf, path).await; }
+            let result = read_file_sel(&path_buf, selector, max_size).await?;
+            Ok(result)
+        }.boxed()
     };
-    Tool::builder(
-        "read",
-        "读取文件内容",
-        required(vec![("path", PropertyType::String, "文件路径")]),
-        std::sync::Arc::new(handler),
-    )
-    .concurrency_safe(true)
-    .timeout(std::time::Duration::from_secs(10))
-    .build()
+    Tool::builder("read", "读取文件内容。支持行范围选择器：path:start-end、path:start+count、path:raw。也支持读取目录列表。", required(vec![("path", PropertyType::String, "文件路径，支持 :N-M :N+count :raw 选择器")]), std::sync::Arc::new(handler))
+        .concurrency_safe(true)
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
 }
 
 fn file_write_tool() -> Tool {
@@ -397,5 +442,65 @@ impl FileToolsPackage {
 impl Default for FileToolsPackage {
     fn default() -> Self {
         Self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::create_tool_manager;
+    use crate::types::ToolManager;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    async fn setup_file(content: &str) -> (TempDir, String) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.txt");
+        fs::write(&path, content).await.unwrap();
+        (dir, path.to_string_lossy().to_string())
+    }
+
+    async fn run_read(path: &str) -> Value {
+        let m = create_tool_manager();
+        m.register_package(FileToolsPackage::new()).await.unwrap();
+        m.execute("file.read", json!({"path": path}), None).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_read_selector_range() {
+        let (_dir, path) = setup_file("line1\nline2\nline3\nline4\nline5\n").await;
+        let r = run_read(&format!("{}:2-4", path)).await;
+        assert_eq!(r["startLine"].as_u64().unwrap(), 2);
+        assert_eq!(r["selectedLines"].as_u64().unwrap(), 3);
+        assert!(r["content"].as_str().unwrap().contains("line2"));
+        assert!(!r["content"].as_str().unwrap().contains("line1"));
+    }
+
+    #[tokio::test]
+    async fn test_read_selector_single_line() {
+        let (_dir, path) = setup_file("a\nb\nc\n").await;
+        let r = run_read(&format!("{}:2", path)).await;
+        assert_eq!(r["content"].as_str().unwrap(), "b");
+    }
+
+    #[tokio::test]
+    async fn test_read_selector_raw() {
+        let (_dir, path) = setup_file("hello\nworld\n").await;
+        let r = run_read(&format!("{}:raw", path)).await;
+        assert_eq!(r["selector"].as_str().unwrap(), "raw");
+        assert_eq!(r["content"].as_str().unwrap(), "hello\nworld\n");
+    }
+
+    #[tokio::test]
+    async fn test_read_directory() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().to_string_lossy().to_string();
+        fs::create_dir(dir.path().join("subdir")).await.unwrap();
+        fs::write(dir.path().join("f.txt"), "hi").await.unwrap();
+        let r = run_read(&p).await;
+        assert!(r["isDirectory"].as_bool().unwrap());
+        let entries = r["entries"].as_array().unwrap();
+        assert!(entries.iter().any(|e| e.as_str().unwrap() == "f.txt"));
+        assert!(entries.iter().any(|e| e.as_str().unwrap() == "subdir/"));
     }
 }
