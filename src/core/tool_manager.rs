@@ -186,8 +186,13 @@ impl ToolManager for ToolManagerImpl {
         let timeout = tool.timeout.unwrap_or(self.config.default_timeout);
         let namespace = resolved.namespace.clone();
         let original_name = resolved.original_name.clone();
+        let mut input = input; // make mutable
         let hook_manager = self.hook_manager.clone();
         let _registry = self.registry.clone();
+
+        // LLM 参数归一化：修复模型中常见的格式问题（null 占位、尾随空白、
+        // JSON 字符串编码数组、单字符串→数组），在 schema 校验前执行。
+        crate::utils::llm_arg_normalizer::normalize_llm_args(&mut input, &tool.input_schema);
 
         if self.config.validate_schemas {
             let errs = validate_input(&input, &tool.input_schema);

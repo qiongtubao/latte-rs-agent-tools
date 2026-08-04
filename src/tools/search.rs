@@ -1,9 +1,9 @@
 //! Enhanced content search tool. Mirrors the `search` tool in oh-my-pi/coding-agent.
 //!
-//! 提供 `file.search` 工具：在文件内容中按正则搜索，支持多目标、glob 路径、gitignore 尊重、
+//! 提供 `search` 工具：在文件内容中按正则搜索，支持多目标、glob 路径、gitignore 尊重、
 //! 大小写不敏感、按文件分页（`skip`）、单文件匹配上限（`limit`）。
 //!
-//! 与项目里旧版 `file.search` 的区别：
+//! 与项目里旧版 `search` 的区别：
 //! - 旧版只有 `path`（单路径） + `filePattern`（文件名 glob） + `maxDepth`；本版用 `paths`
 //!   数组接管，三者都能用 glob 表达。
 //! - 旧版没有 `skip`，命中文件多了只能改 pattern；本版用 `skip` 翻页。
@@ -172,7 +172,7 @@ struct ScanOutput {
     truncated: bool,
 }
 
-/// 构造 `file.search` 工具定义。
+/// 构造 `search` 工具定义。
 pub fn file_search_tool() -> Tool {
     let handler = |input: Value, ctx: ToolExecutionContext| {
         async move {
@@ -348,13 +348,13 @@ pub fn file_search_tool() -> Tool {
             // --- 6. 收结果 + 分页 -----------------------------------------
             let scan_result = tokio::time::timeout(SEARCH_TIMEOUT, scan)
                 .await
-                .map_err(|_| crate::error::ToolError::timeout("file.search", SEARCH_TIMEOUT))?;
+                .map_err(|_| crate::error::ToolError::timeout("search", SEARCH_TIMEOUT))?;
             let mut scan_out = match scan_result {
                 Ok(Ok(s)) => s,
                 Ok(Err(msg)) => return Err(crate::error::ToolError::other(msg)),
                 Err(join) => {
                     return Err(crate::error::ToolError::execution_str(
-                        "file.search",
+                        "search",
                         format!("scan task panicked: {}", join),
                     ));
                 }
@@ -430,23 +430,46 @@ pub fn file_search_tool() -> Tool {
 
     Tool::builder(
         "search",
-        "按正则搜索文件内容",
+        "按正则搜索文件内容。默认在项目根（.）递归搜索全部文件（含 .latte/ 等运行时目录）；强烈建议用 paths 限制搜索范围，避免命中历史日志/大文件导致返回过大。支持按文件分页（skip）与每文件匹配上限（limit）。",
         optional_required(
-            vec![(
-                "pattern",
-                PropertyType::String,
-                "regex 模式，必填",
-            )],
+            vec![
+                (
+                    "pattern",
+                    PropertyType::String,
+                    "regex 模式，必填。大小写是否敏感由 i / ignoreCase 控制。",
+                ),
+                (
+                    "paths",
+                    PropertyType::Array,
+                    "搜索目标：文件、目录或 glob（如 \"src/**/*.rs\"）。可传字符串或字符串数组。默认为 \".\"（整个项目根，会扫入运行时目录）。应显式限定到 src/ tests/ 等源码目录以控制返回量。",
+                ),
+                (
+                    "i",
+                    PropertyType::Boolean,
+                    "是否大小写不敏感（默认 false）。",
+                ),
+                (
+                    "skip",
+                    PropertyType::Number,
+                    "跳过前 N 个有命中的文件，用于分页（配合 totalFileCount 翻页）。默认 0。",
+                ),
+                (
+                    "limit",
+                    PropertyType::Number,
+                    "单个文件最多返回的匹配行数，上限 500，默认 100。",
+                ),
+            ],
             &["pattern"],
         ),
         Arc::new(handler),
     )
     .concurrency_safe(true)
+    .strict(true)
     .timeout(SEARCH_TIMEOUT)
     .build()
 }
 
-/// 把 `file.search` 注册到 `FileToolsPackage`。
+/// 把 `search` 注册到 `FileToolsPackage`。
 pub fn add_file_search(pkg: &mut ToolPackage) {
     pkg.tools.push(file_search_tool());
 }
@@ -503,7 +526,7 @@ mod tests {
 
     async fn run_in(cwd: PathBuf, input: Value) -> Result<Value, crate::error::ToolError> {
         let tool = file_search_tool();
-        let mut ctx = ToolExecutionContext::fresh("file.search", 0);
+        let mut ctx = ToolExecutionContext::fresh("search", 0);
         ctx.metadata = Some(json!({ "cwd": cwd.to_string_lossy() }));
         (tool.handler)(input, ctx).await
     }

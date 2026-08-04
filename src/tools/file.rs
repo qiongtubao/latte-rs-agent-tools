@@ -111,8 +111,8 @@ fn parse_line_range(sel: &str) -> Result<(usize, usize), ToolError> {
 /// 列出目录内容。
 async fn list_directory(dir: &std::path::Path, path_str: &str) -> Result<Value, ToolError> {
     let mut entries: Vec<String> = Vec::new();
-    let mut rd = fs::read_dir(dir).await.map_err(|e| ToolError::execution_str("file.read", e.to_string()))?;
-    while let Some(entry) = rd.next_entry().await.map_err(|e| ToolError::execution_str("file.read", e.to_string()))? {
+    let mut rd = fs::read_dir(dir).await.map_err(|e| ToolError::execution_str("read", e.to_string()))?;
+    while let Some(entry) = rd.next_entry().await.map_err(|e| ToolError::execution_str("read", e.to_string()))? {
         let name = entry.file_name().to_string_lossy().to_string();
         let is_dir = entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false);
         if is_dir { entries.push(format!("{}/", name)); } else { entries.push(name); }
@@ -123,10 +123,10 @@ async fn list_directory(dir: &std::path::Path, path_str: &str) -> Result<Value, 
 
 /// 读取文件，支持选择器。
 async fn read_file_sel(path_buf: &std::path::Path, selector: Option<&str>, max_size: u64) -> Result<Value, ToolError> {
-    let meta = fs::metadata(path_buf).await.map_err(|e| ToolError::execution_str("file.read", format!("stat: {}", e)))?;
+    let meta = fs::metadata(path_buf).await.map_err(|e| ToolError::execution_str("read", format!("stat: {}", e)))?;
     if !meta.is_file() { return Err(ToolError::other(format!("Not a file: {}", path_buf.display()))); }
     if meta.len() > max_size { return Err(ToolError::other(format!("File too large: {} > {}", meta.len(), max_size))); }
-    let bytes = fs::read(path_buf).await.map_err(|e| ToolError::execution_str("file.read", format!("read: {}", e)))?;
+    let bytes = fs::read(path_buf).await.map_err(|e| ToolError::execution_str("read", format!("read: {}", e)))?;
     let total_bytes = bytes.len() as u64;
     let content = String::from_utf8_lossy(&bytes).to_string();
     let total_lines = content.lines().count();
@@ -147,7 +147,7 @@ async fn read_file_sel(path_buf: &std::path::Path, selector: Option<&str>, max_s
     Ok(json!({"content": content, "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "encoding": "utf-8", "modifiedAt": modified}))
 }
 
-/// Standalone `file.read` tool constructor.
+/// Standalone `read` tool constructor.
 pub fn file_read_tool() -> Tool {
     let handler = |input: Value, ctx: ToolExecutionContext| {
         async move {
@@ -155,16 +155,33 @@ pub fn file_read_tool() -> Tool {
             let max_size = input.get("maxSize").and_then(|v| v.as_u64()).unwrap_or(10 * 1024 * 1024);
             let (file_path, selector) = parse_path_selector(path);
             let path_buf = resolve_tool_path(file_path, &ctx);
-            let meta = fs::metadata(&path_buf).await.map_err(|e| ToolError::execution_str("file.read", format!("stat: {}", e)))?;
+            let meta = fs::metadata(&path_buf).await.map_err(|e| ToolError::execution_str("read", format!("stat: {}", e)))?;
             if meta.is_dir() { return list_directory(&path_buf, path).await; }
             let result = read_file_sel(&path_buf, selector, max_size).await?;
             Ok(result)
         }.boxed()
     };
-    Tool::builder("read", "读取文件内容。支持行范围选择器：path:start-end、path:start+count、path:raw。也支持读取目录列表。", required(vec![("path", PropertyType::String, "文件路径，支持 :N-M :N+count :raw 选择器")]), std::sync::Arc::new(handler))
-        .concurrency_safe(true)
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
+    Tool::builder(
+        "read",
+        "读取文件内容。支持行范围选择器：path:start-end、path:start+count、path:raw，大文件务必用行范围分段读取以控制返回量（默认 maxSize=10MB，超出会报错）。也支持读取目录列表。",
+        {
+            // 手动构造 schema：path 必选，maxSize 可选
+            let mut p = BTreeMap::new();
+            p.insert("path".to_string(), prop(PropertyType::String, "文件路径，支持 :start-end :start+count :raw 行范围选择器"));
+            p.insert("maxSize".to_string(), prop(PropertyType::Number, "读取上限（字节），默认 10MB（10485760），超过报 'File too large'。"));
+            ToolInputSchema {
+                schema_type: Default::default(),
+                properties: p,
+                required: Some(vec!["path".to_string()]),
+                additional_properties: None,
+            }
+        },
+        std::sync::Arc::new(handler),
+    )
+    .concurrency_safe(true)
+    .strict(true)
+    .timeout(std::time::Duration::from_secs(10))
+    .build()
 }
 
 fn file_write_tool() -> Tool {
@@ -199,7 +216,7 @@ fn file_write_tool() -> Tool {
                     if !parent.as_os_str().is_empty() {
                         fs::create_dir_all(parent).await.map_err(|e| {
                             crate::error::ToolError::execution_str(
-                                "file.write",
+                                "write",
                                 format!("create_dir_all: {}", e),
                             )
                         })?;
@@ -208,10 +225,10 @@ fn file_write_tool() -> Tool {
             }
             let created = !path_buf.exists();
             let mut file = fs::File::create(&path_buf).await.map_err(|e| {
-                crate::error::ToolError::execution_str("file.write", format!("create: {}", e))
+                crate::error::ToolError::execution_str("write", format!("create: {}", e))
             })?;
             file.write_all(content.as_bytes()).await.map_err(|e| {
-                crate::error::ToolError::execution_str("file.write", format!("write: {}", e))
+                crate::error::ToolError::execution_str("write", format!("write: {}", e))
             })?;
             let _ = file.flush().await;
             Ok(json!({
@@ -296,7 +313,7 @@ async fn list_dir(
     while let Some(entry) = reader
         .next_entry()
         .await
-        .map_err(|e| crate::error::ToolError::execution_str("file.list", e.to_string()))?
+        .map_err(|e| crate::error::ToolError::execution_str("list", e.to_string()))?
     {
         let name = entry.file_name().to_string_lossy().to_string();
         if !include_hidden && name.starts_with('.') {
@@ -384,11 +401,11 @@ fn file_delete_tool() -> Tool {
             }
             if was_dir {
                 fs::remove_dir_all(&path_buf).await.map_err(|e| {
-                    crate::error::ToolError::execution_str("file.delete", format!("rmdir: {}", e))
+                    crate::error::ToolError::execution_str("delete", format!("rmdir: {}", e))
                 })?;
             } else {
                 fs::remove_file(&path_buf).await.map_err(|e| {
-                    crate::error::ToolError::execution_str("file.delete", format!("rm: {}", e))
+                    crate::error::ToolError::execution_str("delete", format!("rm: {}", e))
                 })?;
             }
             Ok(json!({"success": true, "path": path, "wasDirectory": was_dir}))
@@ -415,11 +432,7 @@ impl FileToolsPackage {
         ToolPackage {
             name: "file".into(),
             version: Some("1.0.0".into()),
-            namespace: Some(crate::types::NamespaceConfig {
-                prefix: "file".into(),
-                separator: '.',
-                auto_prefix: true,
-            }),
+            namespace: None,
             description: Some("文件操作工具：读取、写入、列表、删除、搜索、查找".into()),
             dependencies: None,
             tools: vec![
@@ -463,7 +476,7 @@ mod tests {
     async fn run_read(path: &str) -> Value {
         let m = create_tool_manager();
         m.register_package(FileToolsPackage::new()).await.unwrap();
-        m.execute("file.read", json!({"path": path}), None).await.unwrap()
+        m.execute("read", json!({"path": path}), None).await.unwrap()
     }
 
     #[tokio::test]

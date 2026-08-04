@@ -58,7 +58,7 @@ fn required(props: Vec<(&str, PropertyType, &str)>) -> ToolInputSchema {
     schema_with_optional(props, Vec::new())
 }
 
-/// Default wall-clock timeout for `shell.exec`, in milliseconds. Mirrors the
+/// Default wall-clock timeout for `bash`, in milliseconds. Mirrors the
 /// bash tool's old 30s default — overridden by the schema's `timeout` field if
 /// the model asks for a longer cap, or by the env var
 /// `LATTE_AGENT_BASH_TIMEOUT_SECS` for operator-level caps.
@@ -172,7 +172,7 @@ fn shell_exec_tool() -> Tool {
 
                 let mut child = cmd
                     .spawn()
-                    .map_err(|e| crate::error::ToolError::execution("shell.exec", e))?;
+                    .map_err(|e| crate::error::ToolError::execution("bash", e))?;
 
                 // 写 stdin
                 if let Some(payload) = stdin_payload {
@@ -190,7 +190,7 @@ fn shell_exec_tool() -> Tool {
                 return Ok(json!({
                     "jobId": job_key,
                     "status": "running",
-                    "message": format!("Background job {} started. Use shell.exec with `jobId: \"{}\"` and `wait: true` to get the result.", job_key, job_key),
+                    "message": format!("Background job {} started. Use bash with `jobId: \"{}\"` and `wait: true` to get the result.", job_key, job_key),
                 }));
             }
 
@@ -215,11 +215,11 @@ fn shell_exec_tool() -> Tool {
                 .await
                 .map_err(|_| {
                     crate::error::ToolError::timeout(
-                        "shell.exec",
+                        "bash",
                         std::time::Duration::from_millis(timeout_ms),
                     )
                 })?
-                .map_err(|e| crate::error::ToolError::execution("shell.exec", e))?;
+                .map_err(|e| crate::error::ToolError::execution("bash", e))?;
 
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -252,7 +252,7 @@ fn shell_exec_tool() -> Tool {
 
             let mut child = cmd
                 .spawn()
-                .map_err(|e| crate::error::ToolError::execution("shell.exec", e))?;
+                .map_err(|e| crate::error::ToolError::execution("bash", e))?;
 
             // 写 stdin
             if let Some(payload) = stdin_payload {
@@ -269,11 +269,11 @@ fn shell_exec_tool() -> Tool {
             .await
             .map_err(|_| {
                 crate::error::ToolError::timeout(
-                    "shell.exec",
+                    "bash",
                     std::time::Duration::from_millis(timeout_ms),
                 )
             })?
-            .map_err(|e| crate::error::ToolError::execution("shell.exec", e))?;
+            .map_err(|e| crate::error::ToolError::execution("bash", e))?;
 
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -288,7 +288,7 @@ fn shell_exec_tool() -> Tool {
         .boxed()
     };
     Tool::builder(
-        "exec",
+        "bash",
         "执行 shell 命令并返回输出。支持前台执行（默认）和后台执行（`async: true` 返回 jobId，之后用 `wait: true` + `jobId` 取结果）。支持 `stdin` 输入。支持 `cwd`、`timeout`、`env` 参数。",
         schema_with_optional(
             vec![("command", PropertyType::String, "要执行的命令")],
@@ -305,6 +305,7 @@ fn shell_exec_tool() -> Tool {
         std::sync::Arc::new(handler),
     )
     .concurrency_safe(false)
+    .strict(true)
     .timeout(std::time::Duration::from_secs(300))
     .build()
 }
@@ -357,7 +358,7 @@ fn shell_spawn_tool() -> Tool {
 
             let mut child = cmd
                 .spawn()
-                .map_err(|e| crate::error::ToolError::execution("shell.spawn", e))?;
+                .map_err(|e| crate::error::ToolError::execution("spawn", e))?;
 
             if let Some(payload) = stdin_payload.as_deref() {
                 if let Some(stdin) = child.stdin.as_mut() {
@@ -374,11 +375,11 @@ fn shell_spawn_tool() -> Tool {
             .await
             .map_err(|_| {
                 crate::error::ToolError::timeout(
-                    "shell.spawn",
+                    "spawn",
                     std::time::Duration::from_millis(timeout_ms),
                 )
             })?
-            .map_err(|e| crate::error::ToolError::execution("shell.spawn", e))?;
+            .map_err(|e| crate::error::ToolError::execution("spawn", e))?;
 
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -397,8 +398,9 @@ fn shell_spawn_tool() -> Tool {
         required(vec![("command", PropertyType::String, "命令")]),
         std::sync::Arc::new(handler),
     )
-    .concurrency_safe(false)
-    .timeout(std::time::Duration::from_secs(60))
+        .concurrency_safe(false)
+        .strict(true)
+        .timeout(std::time::Duration::from_secs(60))
     .build()
 }
 
@@ -411,11 +413,7 @@ impl ShellToolsPackage {
         ToolPackage {
             name: "shell".into(),
             version: Some("1.0.0".into()),
-            namespace: Some(crate::types::NamespaceConfig {
-                prefix: "shell".into(),
-                separator: '.',
-                auto_prefix: true,
-            }),
+            namespace: None,
             description: Some("Shell 命令执行工具".into()),
             dependencies: None,
             tools: vec![shell_exec_tool(), shell_spawn_tool()],
