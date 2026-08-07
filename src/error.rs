@@ -234,8 +234,8 @@ mod tests {
 
     #[test]
     fn display_round_trip() {
-        let err = ToolError::tool_not_found("git.status");
-        assert_eq!(err.to_string(), "Tool not found: git.status");
+        let err = ToolError::tool_not_found("git_status");
+        assert_eq!(err.to_string(), "Tool not found: git_status");
     }
 
     #[test]

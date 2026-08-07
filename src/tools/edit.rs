@@ -1,6 +1,6 @@
 //! File edit tool — apply precise text edits to files.
 //!
-//! 提供 `file.edit` 工具：对文件做精确的基于行号的文本替换、删除、插入。
+//! 提供 `edit` 工具：对文件做精确的基于行号的文本替换、删除、插入。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use tokio::fs;
 
 use crate::error::ToolError;
 use crate::types::{
-    NamespaceConfig, PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema,
+    PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema,
     ToolPackage,
 };
 
@@ -265,7 +265,7 @@ impl EditToolsPackage {
         ToolPackage {
             name: "edit".into(),
             version: Some("1.0.0".into()),
-            namespace: Some(NamespaceConfig { prefix: "file".into(), separator: '.', auto_prefix: true }),
+            namespace: None,
             description: Some("文件编辑工具".into()),
             dependencies: None,
             tools: vec![file_edit_tool()],
@@ -295,7 +295,7 @@ mod tests {
     async fn run_edit(path: &str, ops: Value) -> Value {
         let m = create_tool_manager();
         m.register_package(EditToolsPackage::new()).await.unwrap();
-        m.execute("file.edit", json!({"path": path, "ops": ops}), None).await.unwrap()
+        m.execute("edit", json!({"path": path, "ops": ops}), None).await.unwrap()
     }
 
     #[tokio::test]

@@ -92,7 +92,7 @@ fn git_status_tool() -> Tool {
         .boxed()
     };
     Tool::builder(
-        "status",
+        "git_status",
         "获取 git 工作区状态",
         optional(vec![
             ("short", PropertyType::Boolean, "使用简短格式"),
@@ -125,7 +125,7 @@ fn git_diff_tool() -> Tool {
         .boxed()
     };
     Tool::builder(
-        "diff",
+        "git_diff",
         "查看 git 差异",
         optional(vec![
             ("staged", PropertyType::Boolean, "显示暂存区的差异"),
@@ -161,7 +161,7 @@ fn git_log_tool() -> Tool {
         .boxed()
     };
     Tool::builder(
-        "log",
+        "git_log",
         "查看 git 提交历史",
         optional(vec![
             ("oneline", PropertyType::Boolean, "使用单行格式"),
@@ -202,7 +202,7 @@ fn git_branch_tool() -> Tool {
         .boxed()
     };
     Tool::builder(
-        "branch",
+        "git_branch",
         "管理 git 分支",
         optional(vec![
             ("list", PropertyType::Boolean, "列出所有分支"),
@@ -233,7 +233,7 @@ fn git_commit_tool() -> Tool {
         .boxed()
     };
     Tool::builder(
-        "commit",
+        "git_commit",
         "创建 git 提交",
         required(vec![("message", PropertyType::String, "提交信息")]),
         std::sync::Arc::new(handler),
@@ -269,7 +269,7 @@ fn git_add_tool() -> Tool {
         .boxed()
     };
     Tool::builder(
-        "add",
+        "git_add",
         "添加文件到暂存区",
         optional(vec![
             ("files", PropertyType::Array, "要添加的文件列表"),
@@ -291,11 +291,7 @@ impl GitToolsPackage {
         ToolPackage {
             name: "git".into(),
             version: Some("1.0.0".into()),
-            namespace: Some(crate::types::NamespaceConfig {
-                prefix: "git".into(),
-                separator: '.',
-                auto_prefix: true,
-            }),
+            namespace: None,
             description: Some("Git 版本控制工具".into()),
             dependencies: None,
             tools: vec![

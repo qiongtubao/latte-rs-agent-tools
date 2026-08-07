@@ -1,6 +1,6 @@
 //! Eval tool — execute Python code in persistent sessions.
 //!
-//! 提供 `eval.exec` 工具：执行 Python 代码，支持持久化 REPL 会话。
+//! 提供 `eval` 工具：执行 Python 代码，支持持久化 REPL 会话。
 //!
 //! ## 用法
 //!
@@ -31,7 +31,7 @@ use tokio::sync::Mutex;
 
 use crate::error::ToolError;
 use crate::types::{
-    NamespaceConfig, PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema,
+    PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema,
     ToolPackage,
 };
 
@@ -115,7 +115,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// 最大超时（秒）。
 const MAX_TIMEOUT_SECS: u64 = 300;
 
-/// 构造 `eval.exec` 工具。
+/// 构造 `eval` 工具。
 fn eval_exec_tool() -> Tool {
     let handler = |input: Value, ctx: ToolExecutionContext| {
         async move {
@@ -215,7 +215,7 @@ fn eval_exec_tool() -> Tool {
     };
 
     Tool::builder(
-        "exec",
+        "eval",
         "Execute Python code and return the output. Supports persistent REPL sessions (use `session_id`) that keep variables across calls. Use `reset: true` to restart a session.",
         eval_schema(),
         std::sync::Arc::new(handler),
@@ -240,7 +240,7 @@ async fn create_python_session(cwd: &Option<String>) -> Result<PySession, ToolEr
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| ToolError::execution("eval.exec", e))?;
+        .map_err(|e| ToolError::execution("eval", e))?;
 
     let stdin = child
         .stdin
@@ -279,12 +279,12 @@ async fn execute_in_session(
         .stdin
         .write_all(full_input.as_bytes())
         .await
-        .map_err(|e| ToolError::execution("eval.exec", e))?;
+        .map_err(|e| ToolError::execution("eval", e))?;
     session
         .stdin
         .flush()
         .await
-        .map_err(|e| ToolError::execution("eval.exec", e))?;
+        .map_err(|e| ToolError::execution("eval", e))?;
 
     // 读取输出直到遇到 marker
     let stdout = session
@@ -315,7 +315,7 @@ async fn execute_in_session(
                     out_lines.push(trimmed);
                 }
             }
-            Ok(Err(e)) => return Err(ToolError::execution("eval.exec", e)),
+            Ok(Err(e)) => return Err(ToolError::execution("eval", e)),
             Err(_) => {
                 err_lines.push(format!("Timeout after {} seconds", timeout.as_secs()));
                 break;
@@ -387,8 +387,8 @@ async fn execute_once(
 
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
-        .map_err(|_| ToolError::timeout("eval.exec", timeout))?
-        .map_err(|e| ToolError::execution("eval.exec", e))?;
+        .map_err(|_| ToolError::timeout("eval", timeout))?
+        .map_err(|e| ToolError::execution("eval", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -412,11 +412,7 @@ impl EvalToolsPackage {
         ToolPackage {
             name: "eval".into(),
             version: Some("1.0.0".into()),
-            namespace: Some(NamespaceConfig {
-                prefix: "eval".into(),
-                separator: '.',
-                auto_prefix: true,
-            }),
+            namespace: None,
             description: Some("Python 代码执行工具：一次性执行或持久化 REPL 会话".into()),
             dependencies: None,
             tools: vec![eval_exec_tool()],
@@ -439,7 +435,7 @@ impl Default for EvalToolsPackage {
 // 单测
 // =============================================================================
 //
-// 测试策略：调用 eval.exec 执行简单 Python 代码，验证输出正确。
+// 测试策略：调用 eval 执行简单 Python 代码，验证输出正确。
 // 注意：需要系统安装 python3。
 
 #[cfg(test)]
@@ -456,7 +452,7 @@ mod tests {
             .await
             .unwrap();
         manager
-            .execute("eval.exec", input, None)
+            .execute("eval", input, None)
             .await
             .unwrap()
     }

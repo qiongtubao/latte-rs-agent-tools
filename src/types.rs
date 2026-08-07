@@ -224,6 +224,11 @@ pub struct Tool {
     pub deprecated: bool,
     /// Optional examples to help the model invoke the tool correctly.
     pub examples: Option<Vec<serde_json::Value>>,
+    /// OpenAI Structured Outputs 开关。`Some(true)` 时下发给模型的
+    /// tool schema 带 `strict: true`，要求模型严格按 input_schema 输出
+    /// （schema 需满足：所有 properties 进 required、
+    /// `additionalProperties: false`）。`None` = 不开。
+    pub strict: Option<bool>,
 }
 
 impl std::fmt::Debug for Tool {
@@ -239,6 +244,7 @@ impl std::fmt::Debug for Tool {
             .field("version", &self.version)
             .field("tags", &self.tags)
             .field("deprecated", &self.deprecated)
+            .field("strict", &self.strict)
             .finish()
     }
 }
@@ -264,6 +270,7 @@ impl Tool {
             tags: None,
             deprecated: false,
             examples: None,
+            strict: None,
         }
     }
 }
@@ -282,6 +289,7 @@ pub struct ToolBuilder {
     tags: Option<Vec<String>>,
     deprecated: bool,
     examples: Option<Vec<serde_json::Value>>,
+    strict: Option<bool>,
 }
 
 impl ToolBuilder {
@@ -325,6 +333,11 @@ impl ToolBuilder {
         self.examples = Some(examples);
         self
     }
+    /// Enable OpenAI Structured Outputs (`strict: true`) for this tool.
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = Some(strict);
+        self
+    }
     /// Finalize and return the `Tool`.
     pub fn build(self) -> Tool {
         Tool {
@@ -340,6 +353,7 @@ impl ToolBuilder {
             tags: self.tags,
             deprecated: self.deprecated,
             examples: self.examples,
+            strict: self.strict,
         }
     }
 }
@@ -353,6 +367,9 @@ pub struct ToolDefinition {
     pub description: String,
     /// JSON Schema describing the expected input.
     pub input_schema: ToolInputSchema,
+    /// OpenAI Structured Outputs 开关（透传自 `Tool.strict`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 /// Resolved name carries the parsed namespace alongside the original name.

@@ -210,6 +210,7 @@ impl ToolRegistryImpl {
                 name: e.tool.name.clone(),
                 description: e.tool.description.clone(),
                 input_schema: e.tool.input_schema.clone(),
+                strict: e.tool.strict,
             })
             .collect()
     }

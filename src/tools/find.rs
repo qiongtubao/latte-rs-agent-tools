@@ -1,7 +1,7 @@
 //! File-system find tool. Mirrors the `find` tool in oh-my-pi/coding-agent.
 //!
-//! 提供 `file.find` 工具：在目录树下按 glob 模式查找文件，并按 mtime 倒序排列。
-//! 与 `file.list`（只列一层）不同，`file.find` 走 `ignore::WalkBuilder` 跨目录递归，
+//! 提供 `find` 工具：在目录树下按 glob 模式查找文件，并按 mtime 倒序排列。
+//! 与 `list`（只列一层）不同，`find` 走 `ignore::WalkBuilder` 跨目录递归，
 //! 自动尊重 `.gitignore` / `.ignore` / `.git/info/exclude`，并支持 `**` 递归 glob。
 //!
 //! ## 输入
@@ -157,7 +157,7 @@ struct FindHit {
 
 /// 走 `root` 下的所有文件，应用 hidden / gitignore 过滤，返回绝对路径列表。
 ///
-/// 这是 `walk_target` 的去 glob 化版本，供 `file.search` 等需要自己处理每个文件的工具复用。
+/// 这是 `walk_target` 的去 glob 化版本，供 `search` 等需要自己处理每个文件的工具复用。
 /// 阻塞遍历——调用方应放在 `spawn_blocking` 里，并配 `tokio::time::timeout`。
 pub(crate) fn walk_all_files(
     root: &Path,
@@ -289,7 +289,7 @@ fn display_relative(abs: &Path, cwd: &Path, is_dir: bool) -> String {
     s
 }
 
-/// 构造 `file.find` 工具定义。
+/// 构造 `find` 工具定义。
 pub fn file_find_tool() -> Tool {
     let handler = |input: Value, ctx: ToolExecutionContext| {
         async move {
@@ -455,14 +455,14 @@ pub fn file_find_tool() -> Tool {
 
             let scan_result = tokio::time::timeout(timeout, scan)
                 .await
-                .map_err(|_| crate::error::ToolError::timeout("file.find", timeout))?;
+                .map_err(|_| crate::error::ToolError::timeout("find", timeout))?;
 
             let (mut hits, saw_dir_root) = match scan_result {
                 Ok(Ok(pair)) => pair,
                 Ok(Err(msg)) => return Err(crate::error::ToolError::other(msg)),
                 Err(join) => {
                     return Err(crate::error::ToolError::execution_str(
-                        "file.find",
+                        "find",
                         format!("scan task panicked: {}", join),
                     ));
                 }
@@ -525,7 +525,7 @@ pub fn file_find_tool() -> Tool {
     .build()
 }
 
-/// 把 `file.find` 注册到 `FileToolsPackage`。
+/// 把 `find` 注册到 `FileToolsPackage`。
 pub fn add_file_find(pkg: &mut ToolPackage) {
     pkg.tools.push(file_find_tool());
 }
@@ -584,7 +584,7 @@ mod tests {
     /// 跑 find tool，cwd 直接用 tempdir 的路径，metadata 注入。
     async fn run_in(cwd: PathBuf, input: Value) -> Result<Value, crate::error::ToolError> {
         let tool = file_find_tool();
-        let mut ctx = ToolExecutionContext::fresh("file.find", 0);
+        let mut ctx = ToolExecutionContext::fresh("find", 0);
         ctx.metadata = Some(json!({ "cwd": cwd.to_string_lossy() }));
         (tool.handler)(input, ctx).await
     }

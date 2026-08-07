@@ -20,12 +20,12 @@ async fn smoke_register_package() {
         .register_package(GitToolsPackage::new())
         .await
         .unwrap();
-    assert!(manager.has("git.status"));
-    assert!(manager.has("git.diff"));
-    assert!(manager.has("git.log"));
-    assert!(manager.has("git.branch"));
-    assert!(manager.has("git.commit"));
-    assert!(manager.has("git.add"));
+    assert!(manager.has("git_status"));
+    assert!(manager.has("git_diff"));
+    assert!(manager.has("git_log"));
+    assert!(manager.has("git_branch"));
+    assert!(manager.has("git_commit"));
+    assert!(manager.has("git_add"));
     assert_eq!(manager.get_tool_names().len(), 6);
 }
 
@@ -37,16 +37,16 @@ async fn smoke_register_and_execute() {
         .await
         .unwrap();
 
-    // file.read with invalid path
+    // read with invalid path
     let result = manager
-        .execute("file.read", serde_json::json!({ "path": "/nonexistent" }), None)
+        .execute("read", serde_json::json!({ "path": "/nonexistent" }), None)
         .await;
     assert!(result.is_err());
 
-    // file.read with existing path (Cargo.toml)
+    // read with existing path (Cargo.toml)
     let result = manager
         .execute(
-            "file.read",
+            "read",
             serde_json::json!({ "path": "Cargo.toml" }),
             None,
         )
@@ -82,7 +82,7 @@ async fn smoke_hooks() {
 
     manager
         .execute(
-            "file.read",
+            "read",
             serde_json::json!({ "path": "Cargo.toml" }),
             None,
         )
@@ -107,8 +107,8 @@ async fn smoke_config_export_import() {
     let resolver = Arc::new(
         crate::resolvers::CompositeHandlerResolver::new(std::time::Duration::from_secs(30)),
     );
-    // Register handlers by short names (exported config uses short names)
-    for name in &["status", "diff", "log", "branch", "commit", "add"] {
+    // Register handlers by flat names (exported config uses flat names)
+    for name in &["git_status", "git_diff", "git_log", "git_branch", "git_commit", "git_add"] {
         let n = *name;
         resolver.register(
             n,
@@ -129,5 +129,5 @@ async fn smoke_config_export_import() {
     let new_manager = ToolManagerFactory::create_from_config(config, opts)
         .await
         .unwrap();
-    assert!(new_manager.has("git.status"));
+    assert!(new_manager.has("git_status"));
 }
