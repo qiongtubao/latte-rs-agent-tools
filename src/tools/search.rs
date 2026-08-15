@@ -20,8 +20,13 @@
 //! - `i` (bool, 可选, 默认 `false`) — 大小写不敏感。
 //! - `ignoreCase` (bool, 可选) — 旧版别名，等价于 `i`。
 //! - `gitignore` (bool, 可选, 默认 `true`) — 是否尊重 `.gitignore`。
+//! - `hidden` (bool, 可选, 默认 `false`) — 是否搜索隐藏目录（`.latte/` `.git/` 等）。
+//!   把隐藏目录直接作为 `paths` 目标时不受此开关影响。
 //! - `skip` (number, 可选, 默认 `0`) — 跳过前 N 个有命中的文件，用于分页。
 //! - `limit` (number, 可选, 默认 100, 上限 500) — 单文件最多返回的匹配行数。
+//!
+//! 另有一个不可配置的总字节上限（100KB，作用于分页后的 matches 文本总量）：
+//! 超过即停止追加并置 `truncated: true`，防止多文件命中撑爆 agent context。
 //!
 //! ## 输出
 //!
@@ -37,7 +42,7 @@
 //!     { "file": "src/main.rs", "line": 12, "content": "// TODO: ..." },
 //!     { "file": "src/lib.rs",  "line": 3,  "content": "// TODO: ..." }
 //!   ],
-//!   "truncated": false,               // true 表示某些文件触发了 per-file limit
+//!   "truncated": false,               // true 表示触发了 per-file limit 或总字节上限
 //!   "missingPaths": []                // 多目标调用时被跳过的缺失路径
 //! }
 //! ```
@@ -64,6 +69,9 @@ const MAX_PER_FILE_LIMIT: u64 = 500;
 const DEFAULT_PER_FILE_LIMIT: u64 = 100;
 /// 整次扫描的硬超时：60 秒。
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// 单次调用返回内容（matches 里 file+content 文本）的总字节上限。
+/// 超过即停止追加、置 `truncated: true`，防止多文件命中撑爆 agent context。
+const MAX_TOTAL_BYTES: usize = 100 * 1024;
 
 /// 把 `(name, type, desc)` 三元组转成 `ToolInputProperty`。
 fn prop(ty: PropertyType, description: &str) -> ToolInputProperty {
@@ -197,6 +205,12 @@ pub fn file_search_tool() -> Tool {
                 .get("gitignore")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
+            // 默认不扫隐藏目录（.latte/ .git/ 等运行时目录）；显式传 hidden:true 才扫。
+            // 注意：显式把隐藏目录本身作为 paths root（如 ".latte/logs"）不受此开关影响。
+            let include_hidden = input
+                .get("hidden")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             // 编译 regex。空 pattern 已在上一步拒绝；这里只处理非法 regex。
             let re_pattern = if ignore_case {
@@ -300,7 +314,7 @@ pub fn file_search_tool() -> Tool {
                         let files: Vec<PathBuf> = if root.is_file() {
                             vec![root.clone()]
                         } else {
-                            walk_all_files(root, /* hidden */ true, use_gitignore)
+                            walk_all_files(root, include_hidden, use_gitignore)
                         };
                         for f in &files {
                             if let Some(m) = matcher.as_ref() {
@@ -392,26 +406,30 @@ pub fn file_search_tool() -> Tool {
                 });
             }
 
-            // 重新统计分页后的 fileCount + totalMatches。
+            // --- 7. 组装结果（应用总字节上限） -----------------------------
+            // 上限作用在分页之后：totalFileCount 仍是分页前的真实统计，
+            // 只是返回的 matches 被截断。放在这里而不是扫描阶段，是为了不破坏
+            // skip 翻页语义（截断只影响输出，不影响扫描/分页的完整性）。
+            let mut total_bytes: usize = 0;
+            let mut matches: Vec<Value> = Vec::new();
             let mut new_files: BTreeSet<String> = BTreeSet::new();
-            for h in &scan_out.hits {
+            for h in scan_out.hits {
+                let entry_bytes = h.file.len() + h.content.len();
+                if total_bytes + entry_bytes > MAX_TOTAL_BYTES {
+                    scan_out.truncated = true;
+                    break;
+                }
+                total_bytes += entry_bytes;
                 new_files.insert(h.file.clone());
+                matches.push(json!({
+                    "file": h.file,
+                    "line": h.line,
+                    "content": h.content,
+                }));
             }
+            // fileCount / totalMatches 反映实际返回的内容（截断后）。
             let new_file_count = new_files.len();
-            let total_matches = scan_out.hits.len();
-
-            // --- 7. 组装结果 ---------------------------------------------
-            let matches: Vec<Value> = scan_out
-                .hits
-                .into_iter()
-                .map(|h| {
-                    json!({
-                        "file": h.file,
-                        "line": h.line,
-                        "content": h.content,
-                    })
-                })
-                .collect();
+            let total_matches = matches.len();
 
             Ok(json!({
                 "scopePath": scope_path,
@@ -430,7 +448,7 @@ pub fn file_search_tool() -> Tool {
 
     Tool::builder(
         "search",
-        "按正则搜索文件内容。默认在项目根（.）递归搜索全部文件（含 .latte/ 等运行时目录）；强烈建议用 paths 限制搜索范围，避免命中历史日志/大文件导致返回过大。支持按文件分页（skip）与每文件匹配上限（limit）。",
+        "按正则搜索文件内容。默认在项目根（.）递归搜索，跳过隐藏目录（.latte/ .git/ 等运行时目录）并尊重 .gitignore；如需搜隐藏目录传 hidden:true，或把该目录直接作为 paths 目标。强烈建议用 paths 限制搜索范围（如 src/ tests/）以控制返回量。支持按文件分页（skip）、每文件匹配上限（limit）与单次返回总字节上限（超出置 truncated）。",
         optional_required(
             vec![
                 (
@@ -441,7 +459,12 @@ pub fn file_search_tool() -> Tool {
                 (
                     "paths",
                     PropertyType::Array,
-                    "搜索目标：文件、目录或 glob（如 \"src/**/*.rs\"）。可传字符串或字符串数组。默认为 \".\"（整个项目根，会扫入运行时目录）。应显式限定到 src/ tests/ 等源码目录以控制返回量。",
+                    "搜索目标：文件、目录或 glob（如 \"src/**/*.rs\"）。可传字符串或字符串数组。默认为 \".\"（整个项目根）。应显式限定到 src/ tests/ 等源码目录以控制返回量。",
+                ),
+                (
+                    "hidden",
+                    PropertyType::Boolean,
+                    "是否搜索隐藏目录（.latte/ .git/ 等），默认 false。把隐藏目录直接作为 paths 目标时不受此开关影响。",
                 ),
                 (
                     "i",
@@ -832,5 +855,122 @@ mod tests {
         // 200 个匹配被截断到默认 100
         let matches = out["matches"].as_array().unwrap();
         assert_eq!(matches.len(), DEFAULT_PER_FILE_LIMIT as usize);
+    }
+
+    /// 测试：默认不搜隐藏目录（.latte/ 等）；hidden:true 时才搜。
+    #[tokio::test]
+    async fn search_excludes_hidden_dirs_by_default() {
+        let dir = build_tree();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".latte").join("logs")).unwrap();
+        fs::write(
+            root.join(".latte").join("logs").join("run.log"),
+            "TODO hidden hit\n",
+        )
+        .unwrap();
+
+        // 默认：隐藏目录里的命中不应出现
+        let out = run_in(root.to_path_buf(), json!({ "pattern": "TODO" }))
+            .await
+            .unwrap();
+        let files: Vec<&str> = out["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["file"].as_str().unwrap())
+            .collect();
+        assert!(
+            !files.iter().any(|f| f.contains(".latte")),
+            "files: {:?}",
+            files
+        );
+
+        // hidden:true → 能搜到
+        let out = run_in(
+            root.to_path_buf(),
+            json!({ "pattern": "TODO", "hidden": true }),
+        )
+        .await
+        .unwrap();
+        let files: Vec<&str> = out["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["file"].as_str().unwrap())
+            .collect();
+        assert!(
+            files.iter().any(|f| f.contains(".latte")),
+            "files: {:?}",
+            files
+        );
+    }
+
+    /// 测试：把隐藏目录显式作为 paths root 时，不受 hidden 开关影响。
+    #[tokio::test]
+    async fn search_hidden_dir_as_explicit_root_still_works() {
+        let dir = build_tree();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".latte").join("logs")).unwrap();
+        fs::write(
+            root.join(".latte").join("logs").join("run.log"),
+            "TODO hidden hit\n",
+        )
+        .unwrap();
+
+        let out = run_in(
+            root.to_path_buf(),
+            json!({ "pattern": "TODO", "paths": [".latte"] }),
+        )
+        .await
+        .unwrap();
+        let files: Vec<&str> = out["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["file"].as_str().unwrap())
+            .collect();
+        assert!(
+            files.iter().any(|f| f.contains(".latte")),
+            "files: {:?}",
+            files
+        );
+    }
+
+    /// 测试：总字节上限触发截断，且返回内容总量在上限以内。
+    #[tokio::test]
+    async fn search_total_byte_cap_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // 10 个文件 × 100 行 × 每行 200 字节 ≈ 200KB 命中文本，远超 100KB 上限。
+        // per-file limit 默认 100，正好每文件全量返回。
+        let line = format!("// TODO {}\n", "x".repeat(190));
+        for f in 0..10 {
+            let mut content = String::new();
+            for _ in 0..100 {
+                content.push_str(&line);
+            }
+            fs::write(root.join(format!("dense_{}.rs", f)), content).unwrap();
+        }
+
+        let out = run_in(root.to_path_buf(), json!({ "pattern": "TODO" }))
+            .await
+            .unwrap();
+        assert_eq!(out["truncated"], true);
+        let matches = out["matches"].as_array().unwrap();
+        // 1000 个命中被截断；返回的字节总量不应超过上限
+        assert!(matches.len() < 1000, "matches: {}", matches.len());
+        let returned_bytes: usize = matches
+            .iter()
+            .map(|m| {
+                m["file"].as_str().unwrap().len() + m["content"].as_str().unwrap().len()
+            })
+            .sum();
+        assert!(
+            returned_bytes <= MAX_TOTAL_BYTES,
+            "returned_bytes: {}",
+            returned_bytes
+        );
+        // totalMatches 与 matches 长度一致（截断后）
+        assert_eq!(out["totalMatches"].as_u64().unwrap(), matches.len() as u64);
     }
 }
