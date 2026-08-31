@@ -51,7 +51,12 @@ fn required(props: Vec<(&str, PropertyType, &str)>) -> ToolInputSchema {
 fn optional(props: Vec<(&str, PropertyType, &str)>) -> ToolInputSchema {
     let mut p = BTreeMap::new();
     for (name, ty, desc) in props {
-        p.insert(name.to_string(), prop(ty, desc));
+        let is_array = ty == PropertyType::Array;
+        let mut property = prop(ty, desc);
+        if is_array {
+            property.items = Some(Box::new(prop(PropertyType::String, "File path.")));
+        }
+        p.insert(name.to_string(), property);
     }
     ToolInputSchema {
         schema_type: Default::default(),

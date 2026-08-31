@@ -45,6 +45,11 @@ fn schema_with_optional(
             p.insert(name.to_string(), prop(ty, desc));
         }
     }
+    if let Some(env) = p.get_mut("env") {
+        env.additional_properties = Some(
+            prop(PropertyType::String, "Environment variable value.").into(),
+        );
+    }
     ToolInputSchema {
         schema_type: Default::default(),
         properties: p,

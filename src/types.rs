@@ -79,22 +79,25 @@ pub struct ToolInputProperty {
     /// Maximum for numeric types.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum: Option<f64>,
-    /// Minimum length for strings/arrays.
+    /// Minimum length for strings/arrays. The model wire adapter emits this as
+    /// `minLength` for strings and `minItems` for arrays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_length: Option<usize>,
-    /// Maximum length for strings/arrays.
+    /// Maximum length for strings/arrays. The model wire adapter emits this as
+    /// `maxLength` for strings and `maxItems` for arrays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_length: Option<usize>,
-    /// Element schema for `array` properties (JSON Schema `items`).
+    /// Item schema for arrays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub items: Option<Box<ToolInputProperty>>,
-    /// Nested properties for `object` properties (JSON Schema `properties`).
+    /// Nested property schemas for objects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub properties: Option<BTreeMap<String, ToolInputProperty>>,
-    /// Required nested property names for `object` properties.
+    /// Required nested object property names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub required: Option<Vec<String>>,
-    /// Whether nested objects allow additional properties.
+    /// Whether unknown nested properties are allowed, or the schema every
+    /// unknown property value must satisfy (for typed maps such as env vars).
     #[serde(
         rename = "additionalProperties",
         default,
@@ -103,39 +106,25 @@ pub struct ToolInputProperty {
     pub additional_properties: Option<ToolAdditionalProperties>,
 }
 
-impl ToolInputProperty {
-    /// Set the element schema of an `array` property (builder style).
-    pub fn with_items(mut self, items: ToolInputProperty) -> Self {
-        self.items = Some(Box::new(items));
-        self
-    }
-
-    /// Set the nested schema of an `object` property (builder style).
-    pub fn with_object(
-        mut self,
-        properties: BTreeMap<String, ToolInputProperty>,
-        required: Option<Vec<String>>,
-        additional_properties: Option<ToolAdditionalProperties>,
-    ) -> Self {
-        self.properties = Some(properties);
-        self.required = required;
-        self.additional_properties = additional_properties;
-        self
-    }
-}
-
-/// JSON Schema `additionalProperties`: either a boolean toggle or a nested
-/// schema. Serializes untagged (`false` / `{...}`).
+/// JSON Schema's `additionalProperties` accepts either a boolean or a schema.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum ToolAdditionalProperties {
-    /// Boolean toggle (`false` = no extra keys allowed).
+    /// Allow or reject undeclared properties.
     Boolean(bool),
+    /// Validate every undeclared property value against this schema.
+    Schema(Box<ToolInputProperty>),
 }
 
 impl From<bool> for ToolAdditionalProperties {
-    fn from(b: bool) -> Self {
-        Self::Boolean(b)
+    fn from(value: bool) -> Self {
+        Self::Boolean(value)
+    }
+}
+
+impl From<ToolInputProperty> for ToolAdditionalProperties {
+    fn from(value: ToolInputProperty) -> Self {
+        Self::Schema(Box::new(value))
     }
 }
 
@@ -157,6 +146,36 @@ pub enum PropertyType {
     Object,
     /// JSON null.
     Null,
+}
+
+impl ToolInputProperty {
+    /// Attach an array item schema.
+    pub fn with_items(mut self, items: ToolInputProperty) -> Self {
+        self.items = Some(Box::new(items));
+        self
+    }
+
+    /// Attach nested object properties, required names, and unknown-key policy.
+    pub fn with_object(
+        mut self,
+        properties: BTreeMap<String, ToolInputProperty>,
+        required: Option<Vec<String>>,
+        additional_properties: Option<ToolAdditionalProperties>,
+    ) -> Self {
+        self.properties = Some(properties);
+        self.required = required;
+        self.additional_properties = additional_properties;
+        self
+    }
+
+    /// Attach an `additionalProperties` policy (including a typed map schema).
+    pub fn with_additional_properties(
+        mut self,
+        additional_properties: impl Into<ToolAdditionalProperties>,
+    ) -> Self {
+        self.additional_properties = Some(additional_properties.into());
+        self
+    }
 }
 
 /// Top-level tool input schema (JSON Schema `object`).

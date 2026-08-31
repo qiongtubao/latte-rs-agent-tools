@@ -23,7 +23,11 @@ fn all_props_connect() -> ToolInputSchema {
 fn all_props_call() -> ToolInputSchema {
     let mut p = BTreeMap::new();
     p.insert("tool".into(), prop(PropertyType::String, "Name of the MCP tool to call"));
-    p.insert("arguments".into(), prop(PropertyType::Object, "JSON arguments for the tool"));
+    p.insert(
+        "arguments".into(),
+        prop(PropertyType::Object, "JSON arguments for the tool")
+            .with_additional_properties(true),
+    );
     p.insert("server_index".into(), prop(PropertyType::Integer, "Server index (default: 0)"));
     ToolInputSchema { schema_type: Default::default(), properties: p, required: Some(vec!["tool".into(), "arguments".into()]), additional_properties: None }
 }

@@ -130,6 +130,20 @@ fn locate_block_sloppy(
 fn edit_schema() -> ToolInputSchema {
     let mut p = BTreeMap::new();
     p.insert("path".into(), prop(PropertyType::String, "File path to edit (required)."));
+    let op_properties = [
+        ("start_line".into(), prop(PropertyType::Integer, "1-based start line for line edits.")),
+        ("end_line".into(), prop(PropertyType::Integer, "Inclusive end line for line edits.")),
+        ("expect".into(), prop(PropertyType::String, "Expected text at the selected line range; uniquely relocates stale line numbers.")),
+        ("old_text".into(), prop(PropertyType::String, "Exact text to replace for text edits.")),
+        ("new_text".into(), prop(PropertyType::String, "Replacement text for text edits.")),
+        ("new_content".into(), prop(PropertyType::String, "Inserted or replacement content for line edits.")),
+        ("delete".into(), prop(PropertyType::Boolean, "Delete the selected text or line range.")),
+        ("insert_after".into(), prop(PropertyType::Boolean, "Insert new_content after start_line.")),
+        ("insert_before".into(), prop(PropertyType::Boolean, "Insert new_content before start_line.")),
+        ("all".into(), prop(PropertyType::Boolean, "Replace every old_text occurrence instead of requiring a unique match.")),
+    ]
+    .into_iter()
+    .collect();
     p.insert(
         "tag".into(),
         prop(
@@ -142,37 +156,18 @@ fn edit_schema() -> ToolInputSchema {
     );
     p.insert(
         "ops".into(),
-        ToolInputProperty {
-            property_type: PropertyType::Array,
-            description: Some(
-                "Array of edit operations. Each op is either line-based \
-                 (start_line[, end_line][, delete|insert_after|insert_before], new_content) \
-                 or text-based (old_text, new_text|delete). For line-based ops also pass \
-                 `expect` — the exact text you believe occupies that range: it is verified, \
-                 and if your line numbers are slightly off the tool relocates the edit \
-                 automatically (unique match) instead of corrupting the wrong lines. \
-                 Text-based ops must match exactly one location; if `old_text` occurs \
-                 multiple times the edit is rejected — widen the context to make it unique, \
-                 or pass `all: true` to intentionally replace every occurrence."
-                    .into(),
+        prop(
+            PropertyType::Array,
+            "Array of edit operations. Each op is either line-based or text-based; \
+             pass `expect` to relocate stale line ranges, or `all: true` to replace \
+             every old_text occurrence.",
+        ).with_items(
+            prop(PropertyType::Object, "One text or line edit operation.").with_object(
+                op_properties,
+                None,
+                Some(false.into()),
             ),
-            enum_values: None,
-            minimum: None,
-            maximum: None,
-            min_length: None,
-            max_length: None,
-            items: Some(Box::new(ToolInputProperty {
-                property_type: PropertyType::Object,
-                description: Some("One edit operation (line-based or text-based).".into()),
-                enum_values: None,
-                minimum: None,
-                maximum: None,
-                min_length: None,
-                max_length: None,
-                items: None, properties: None, required: None, additional_properties: None,
-            })),
-            properties: None, required: None, additional_properties: None,
-        },
+        ),
     );
     ToolInputSchema {
         schema_type: Default::default(),

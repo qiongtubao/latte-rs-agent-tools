@@ -5,7 +5,9 @@
 //! emitted by `ToolInputSchema`.
 
 
-use crate::types::{PropertyType, ToolInputProperty, ToolInputSchema};
+use crate::types::{
+    PropertyType, ToolAdditionalProperties, ToolInputProperty, ToolInputSchema,
+};
 
 /// Returned by [`validate_input`] / [`validate_schema`].
 #[derive(Debug, Clone, Default)]
@@ -112,6 +114,52 @@ fn validate_type(
             "Property '{}' must be {:?}, got {}",
             key, schema.property_type, actual
         ));
+    }
+
+    if let Some(items) = schema.items.as_deref() {
+        if let Some(values) = value.as_array() {
+            for (index, item) in values.iter().enumerate() {
+                if let Some(error) = validate_type(item, &format!("{key}[{index}]"), items) {
+                    return Some(error);
+                }
+            }
+        }
+    }
+
+    if let Some(object) = value.as_object() {
+        if let Some(required) = schema.required.as_ref() {
+            for required_key in required {
+                if !object.contains_key(required_key) {
+                    return Some(format!(
+                        "Missing required property: {key}.{required_key}"
+                    ));
+                }
+            }
+        }
+        for (nested_key, nested_value) in object {
+            let nested_path = format!("{key}.{nested_key}");
+            if let Some(properties) = schema.properties.as_ref() {
+                if let Some(nested_schema) = properties.get(nested_key) {
+                    if let Some(error) = validate_type(nested_value, &nested_path, nested_schema) {
+                        return Some(error);
+                    }
+                    continue;
+                }
+            }
+            match schema.additional_properties.as_ref() {
+                Some(ToolAdditionalProperties::Boolean(false)) => {
+                    return Some(format!("Unknown property: {nested_path}"));
+                }
+                Some(ToolAdditionalProperties::Schema(additional_schema)) => {
+                    if let Some(error) =
+                        validate_type(nested_value, &nested_path, additional_schema)
+                    {
+                        return Some(error);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     // Enum check
@@ -251,5 +299,106 @@ mod tests {
     fn validates_schema_shape() {
         let result = validate_schema(&serde_json::json!({ "type": "not_object" }));
         assert!(!result.valid);
+    }
+
+    #[test]
+    fn serializes_recursive_array_object_schema() {
+        let item = prop(PropertyType::Object).with_object(
+            [("label".into(), prop(PropertyType::String))]
+                .into_iter()
+                .collect(),
+            Some(vec!["label".into()]),
+            Some(false.into()),
+        );
+        let schema = schema_with(
+            [("options".into(), prop(PropertyType::Array).with_items(item))]
+                .into_iter()
+                .collect(),
+            vec!["options".into()],
+        );
+        let wire = serde_json::to_value(schema).expect("serialize schema");
+        assert_eq!(wire["properties"]["options"]["items"]["type"], "object");
+        assert_eq!(
+            wire["properties"]["options"]["items"]["properties"]["label"]["type"],
+            "string"
+        );
+        assert_eq!(
+            wire["properties"]["options"]["items"]["required"],
+            serde_json::json!(["label"])
+        );
+        assert_eq!(
+            wire["properties"]["options"]["items"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn serializes_typed_additional_properties_and_standard_enum() {
+        let mut env = prop(PropertyType::Object).with_additional_properties(
+            prop(PropertyType::String),
+        );
+        env.enum_values = Some(vec![serde_json::json!({"A": "1"})]);
+        let wire = serde_json::to_value(env).expect("serialize property");
+        assert_eq!(wire["additionalProperties"]["type"], "string");
+        assert!(wire.get("enum_values").is_none());
+        assert!(wire.get("enum").is_some());
+    }
+
+    #[test]
+    fn legacy_property_deserialization_defaults_recursive_fields() {
+        let legacy = serde_json::json!({
+            "type": "string",
+            "description": "legacy",
+            "enum_values": ["a", "b"],
+            "min_length": 1
+        });
+        let property: ToolInputProperty =
+            serde_json::from_value(legacy).expect("legacy schema must deserialize");
+        assert_eq!(property.enum_values, Some(vec!["a".into(), "b".into()]));
+        assert_eq!(property.min_length, Some(1));
+        assert!(property.items.is_none());
+        assert!(property.properties.is_none());
+        assert!(property.required.is_none());
+        assert!(property.additional_properties.is_none());
+    }
+
+    #[test]
+    fn validates_nested_items_required_and_typed_maps() {
+        let item = prop(PropertyType::Object).with_object(
+            [("label".into(), prop(PropertyType::String))]
+                .into_iter()
+                .collect(),
+            Some(vec!["label".into()]),
+            Some(false.into()),
+        );
+        let env = prop(PropertyType::Object)
+            .with_additional_properties(prop(PropertyType::String));
+        let schema = schema_with(
+            [
+                ("options".into(), prop(PropertyType::Array).with_items(item)),
+                ("env".into(), env),
+            ]
+            .into_iter()
+            .collect(),
+            vec!["options".into()],
+        );
+
+        assert!(validate_input(
+            &serde_json::json!({"options": [{"label": "A"}], "env": {"A": "1"}}),
+            &schema,
+        )
+        .valid);
+        let missing = validate_input(
+            &serde_json::json!({"options": [{}]}),
+            &schema,
+        );
+        assert!(!missing.valid);
+        assert!(missing.errors[0].contains("options[0].label"));
+        let wrong_map = validate_input(
+            &serde_json::json!({"options": [{"label": "A"}], "env": {"A": 1}}),
+            &schema,
+        );
+        assert!(!wrong_map.valid);
+        assert!(wrong_map.errors[0].contains("env.A"));
     }
 }

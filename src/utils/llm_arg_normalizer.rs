@@ -10,80 +10,100 @@ use crate::types::{PropertyType, ToolInputSchema};
 ///
 /// 在 `validate_input` 之前调用。修改 `args` 原地。
 pub fn normalize_llm_args(args: &mut serde_json::Value, schema: &ToolInputSchema) {
-    if !args.is_object() {
-        return;
-    }
     let Some(obj) = args.as_object_mut() else {
         return;
     };
+    normalize_object(obj, &schema.properties, schema.required.as_deref());
+}
 
-    // 1. 可选字段的 null / "" → 删除（如果该字段不在 required 中）。
-    //    LLM 常用 null 或空串表示"不传"，但校验层会拒绝类型不符。
-    if let Some(required) = &schema.required {
-        for (key, value) in obj.clone().iter() {
-            if !required.contains(key) {
-                if value.is_null() || value.as_str() == Some("") {
-                    obj.remove(key);
+fn normalize_object(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    properties: &std::collections::BTreeMap<String, crate::types::ToolInputProperty>,
+    required: Option<&[String]>,
+) {
+    // 可选字段的 null / "" → 删除。LLM 常用它们表示“不传”。
+    if let Some(required) = required {
+        obj.retain(|key, value| {
+            required.contains(key) || (!value.is_null() && value.as_str() != Some(""))
+        });
+    }
+
+    // 所有对象层级都清理字符串外围空白；随后按声明递归处理已知字段。
+    for value in obj.values_mut() {
+        if let Some(text) = value.as_str() {
+            let trimmed = text.trim();
+            if trimmed.len() != text.len() {
+                *value = serde_json::Value::String(trimmed.to_string());
+            }
+        }
+    }
+    for (key, property) in properties {
+        if let Some(value) = obj.get_mut(key) {
+            normalize_property(value, property);
+        }
+    }
+}
+
+fn normalize_property(
+    value: &mut serde_json::Value,
+    schema: &crate::types::ToolInputProperty,
+) {
+    match schema.property_type {
+        PropertyType::Array => {
+            if let Some(text) = value.as_str() {
+                let parsed = serde_json::from_str::<serde_json::Value>(text)
+                    .ok()
+                    .filter(serde_json::Value::is_array)
+                    .unwrap_or_else(|| serde_json::json!([text]));
+                *value = parsed;
+            }
+            let (Some(items), Some(values)) = (schema.items.as_deref(), value.as_array_mut())
+            else {
+                return;
+            };
+            for item in values {
+                // 模型常把 string item 包成 {"text":"..."}；严格校验前取其首个字符串值。
+                if items.property_type == PropertyType::String {
+                    if let Some(text) = item
+                        .as_object()
+                        .and_then(|object| object.values().find_map(serde_json::Value::as_str))
+                    {
+                        *item = serde_json::Value::String(text.to_string());
+                    }
                 }
+                normalize_property(item, items);
             }
         }
-    }
-
-    // 2. 字符串值的尾随空白/换行去除（路径、标识符类字段）。
-    //    LLM 偶尔在字符串末尾附加换行符。
-    let mut keys_to_trim: Vec<String> = Vec::new();
-    for (key, value) in &*obj {
-        if let Some(s) = value.as_str() {
-            let trimmed = s.trim();
-            if trimmed.len() != s.len() {
-                keys_to_trim.push(key.clone());
+        PropertyType::Object => {
+            let Some(object) = value.as_object_mut() else {
+                return;
+            };
+            if let Some(properties) = &schema.properties {
+                normalize_object(object, properties, schema.required.as_deref());
             }
-        }
-    }
-    for key in keys_to_trim {
-        if let Some(v) = obj.get_mut(&key) {
-            if let Some(s) = v.as_str() {
-                *v = serde_json::Value::String(s.trim().to_string());
-            }
-        }
-    }
-
-    // 3. JSON 字符串编码的数组 → 真数组（如 `paths: '["a","b"]'` → `["a","b"]`）。
-    //    当 schema 属性声明为 Array 但传了字符串时，尝试解析 JSON。
-    for (key, prop_schema) in &schema.properties {
-        if prop_schema.property_type != PropertyType::Array {
-            continue;
-        }
-        if let Some(v) = obj.get(key) {
-            if let Some(s) = v.as_str() {
-                // 尝试解析为 JSON 数组
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                    if parsed.is_array() {
-                        obj.insert(key.clone(), parsed);
+            if let Some(crate::types::ToolAdditionalProperties::Schema(additional)) =
+                &schema.additional_properties
+            {
+                for (key, child) in object {
+                    if schema
+                        .properties
+                        .as_ref()
+                        .is_none_or(|properties| !properties.contains_key(key))
+                    {
+                        normalize_property(child, additional);
                     }
                 }
             }
         }
-    }
-
-    // 4. 单字符串 → 单元素数组转换（如 `paths: "src"` → `["src"]`）。
-    //    当 schema 声明 Array 但传了 string 时，包成数组。
-    for (key, prop_schema) in &schema.properties {
-        if prop_schema.property_type != PropertyType::Array {
-            continue;
-        }
-        if let Some(v) = obj.get(key) {
-            if let Some(s) = v.as_str() {
-                // 已经是 JSON 字符串编码的数组（如 '["src"]'）→ 上面第 3 步已经处理了
-                // 这里处理纯字符串（如 "src"）
-                let already_parsed = serde_json::from_str::<serde_json::Value>(s)
-                    .map(|parsed| parsed.is_array())
-                    .unwrap_or(false);
-                if !already_parsed {
-                    obj.insert(key.clone(), serde_json::json!([s]));
+        PropertyType::String => {
+            if let Some(text) = value.as_str() {
+                let trimmed = text.trim();
+                if trimmed.len() != text.len() {
+                    *value = serde_json::Value::String(trimmed.to_string());
                 }
             }
         }
+        _ => {}
     }
 }
 
@@ -180,6 +200,85 @@ mod tests {
         let mut args = json!({"paths": "src"});
         normalize_llm_args(&mut args, &schema);
         assert_eq!(args["paths"], json!(["src"]), "plain string wrapped to array");
+    }
+
+    #[test]
+    fn test_recursive_array_item_normalization() {
+        let string_item = ToolInputProperty {
+            property_type: PropertyType::String,
+            description: None,
+            enum_values: None,
+            minimum: None,
+            maximum: None,
+            min_length: None,
+            max_length: None,
+            items: None,
+            properties: None,
+            required: None,
+            additional_properties: None,
+        };
+        let string_list = ToolInputProperty {
+            property_type: PropertyType::Array,
+            description: None,
+            enum_values: None,
+            minimum: None,
+            maximum: None,
+            min_length: None,
+            max_length: None,
+            items: Some(Box::new(string_item)),
+            properties: None,
+            required: None,
+            additional_properties: None,
+        };
+        let option = ToolInputProperty {
+            property_type: PropertyType::Object,
+            description: None,
+            enum_values: None,
+            minimum: None,
+            maximum: None,
+            min_length: None,
+            max_length: None,
+            items: None,
+            properties: Some(BTreeMap::from([
+                ("pros".into(), string_list.clone()),
+                ("cons".into(), string_list),
+            ])),
+            required: None,
+            additional_properties: Some(true.into()),
+        };
+        let schema = ToolInputSchema {
+            schema_type: Default::default(),
+            properties: BTreeMap::from([(
+                "options".into(),
+                ToolInputProperty {
+                    property_type: PropertyType::Array,
+                    description: None,
+                    enum_values: None,
+                    minimum: None,
+                    maximum: None,
+                    min_length: None,
+                    max_length: None,
+                    items: Some(Box::new(option)),
+                    properties: None,
+                    required: None,
+                    additional_properties: None,
+                },
+            )]),
+            required: Some(vec!["options".into()]),
+            additional_properties: None,
+        };
+        let mut args = json!({
+            "options": [{
+                "pros": "fast\nsimple",
+                "cons": [{"text": "stateful"}]
+            }]
+        });
+
+        normalize_llm_args(&mut args, &schema);
+
+        assert_eq!(args["options"][0]["pros"], json!(["fast\nsimple"]));
+        assert_eq!(args["options"][0]["cons"], json!(["stateful"]));
+        assert!(crate::utils::schema_validator::validate_input(&args, &schema).valid);
     }
 
     #[test]

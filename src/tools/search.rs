@@ -126,6 +126,12 @@ fn optional_required(
     for (name, ty, desc) in props {
         p.insert(name.to_string(), prop(ty, desc));
     }
+    if let Some(paths) = p.get_mut("paths") {
+        paths.items = Some(Box::new(prop(
+            PropertyType::String,
+            "File, directory, or glob path.",
+        )));
+    }
     ToolInputSchema {
         schema_type: Default::default(),
         properties: p,
