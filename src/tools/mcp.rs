@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 use crate::types::{PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema, ToolPackage};
 
 fn prop(ty: PropertyType, desc: &str) -> ToolInputProperty {
-    ToolInputProperty { property_type: ty, description: Some(desc.into()), enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None }
+    ToolInputProperty { property_type: ty, description: Some(desc.into()), enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None, items: None, properties: None, required: None, additional_properties: None }
 }
 
 fn all_props_connect() -> ToolInputSchema {

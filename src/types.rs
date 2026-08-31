@@ -80,6 +80,58 @@ pub struct ToolInputProperty {
     /// Maximum length for strings/arrays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_length: Option<usize>,
+    /// Element schema for `array` properties (JSON Schema `items`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Box<ToolInputProperty>>,
+    /// Nested properties for `object` properties (JSON Schema `properties`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<BTreeMap<String, ToolInputProperty>>,
+    /// Required nested property names for `object` properties.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<Vec<String>>,
+    /// Whether nested objects allow additional properties.
+    #[serde(
+        rename = "additionalProperties",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub additional_properties: Option<ToolAdditionalProperties>,
+}
+
+impl ToolInputProperty {
+    /// Set the element schema of an `array` property (builder style).
+    pub fn with_items(mut self, items: ToolInputProperty) -> Self {
+        self.items = Some(Box::new(items));
+        self
+    }
+
+    /// Set the nested schema of an `object` property (builder style).
+    pub fn with_object(
+        mut self,
+        properties: BTreeMap<String, ToolInputProperty>,
+        required: Option<Vec<String>>,
+        additional_properties: Option<ToolAdditionalProperties>,
+    ) -> Self {
+        self.properties = Some(properties);
+        self.required = required;
+        self.additional_properties = additional_properties;
+        self
+    }
+}
+
+/// JSON Schema `additionalProperties`: either a boolean toggle or a nested
+/// schema. Serializes untagged (`false` / `{...}`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum ToolAdditionalProperties {
+    /// Boolean toggle (`false` = no extra keys allowed).
+    Boolean(bool),
+}
+
+impl From<bool> for ToolAdditionalProperties {
+    fn from(b: bool) -> Self {
+        Self::Boolean(b)
+    }
 }
 
 /// Supported JSON Schema property types.
@@ -224,6 +276,11 @@ pub struct Tool {
     pub deprecated: bool,
     /// Optional examples to help the model invoke the tool correctly.
     pub examples: Option<Vec<serde_json::Value>>,
+    /// OpenAI Structured Outputs 开关。`Some(true)` 时下发给模型的
+    /// tool schema 带 `strict: true`，要求模型严格按 input_schema 输出
+    /// （schema 需满足：所有 properties 进 required、
+    /// `additionalProperties: false`）。`None` = 不开。
+    pub strict: Option<bool>,
 }
 
 impl std::fmt::Debug for Tool {
@@ -239,6 +296,7 @@ impl std::fmt::Debug for Tool {
             .field("version", &self.version)
             .field("tags", &self.tags)
             .field("deprecated", &self.deprecated)
+            .field("strict", &self.strict)
             .finish()
     }
 }
@@ -264,6 +322,7 @@ impl Tool {
             tags: None,
             deprecated: false,
             examples: None,
+            strict: None,
         }
     }
 }
@@ -282,6 +341,7 @@ pub struct ToolBuilder {
     tags: Option<Vec<String>>,
     deprecated: bool,
     examples: Option<Vec<serde_json::Value>>,
+    strict: Option<bool>,
 }
 
 impl ToolBuilder {
@@ -325,6 +385,11 @@ impl ToolBuilder {
         self.examples = Some(examples);
         self
     }
+    /// Enable OpenAI Structured Outputs (`strict: true`) for this tool.
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = Some(strict);
+        self
+    }
     /// Finalize and return the `Tool`.
     pub fn build(self) -> Tool {
         Tool {
@@ -340,6 +405,7 @@ impl ToolBuilder {
             tags: self.tags,
             deprecated: self.deprecated,
             examples: self.examples,
+            strict: self.strict,
         }
     }
 }
@@ -353,6 +419,9 @@ pub struct ToolDefinition {
     pub description: String,
     /// JSON Schema describing the expected input.
     pub input_schema: ToolInputSchema,
+    /// OpenAI Structured Outputs 开关（透传自 `Tool.strict`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 /// Resolved name carries the parsed namespace alongside the original name.

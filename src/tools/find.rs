@@ -71,6 +71,7 @@ fn prop(ty: PropertyType, description: &str) -> ToolInputProperty {
         maximum: None,
         min_length: None,
         max_length: None,
+        items: None, properties: None, required: None, additional_properties: None,
     }
 }
 

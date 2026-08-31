@@ -67,6 +67,7 @@ fn prop(ty: PropertyType, description: &str) -> ToolInputProperty {
         maximum: None,
         min_length: None,
         max_length: None,
+        items: None, properties: None, required: None, additional_properties: None,
     }
 }
 
@@ -357,6 +358,8 @@ pub fn http_fetch_tool() -> Tool {
 }
 
 /// `http` 工具包：目前只包含 `fetch` 一个工具。
+///
+/// 注册后工具的全名是 `fetch`（namespace 已禁用）。
 pub struct HttpToolsPackage;
 
 impl HttpToolsPackage {

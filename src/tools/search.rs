@@ -23,8 +23,13 @@
 //! - `i` (bool, 可选, 默认 `false`) — 大小写不敏感。
 //! - `ignoreCase` (bool, 可选) — 旧版别名，等价于 `i`。
 //! - `gitignore` (bool, 可选, 默认 `true`) — 是否尊重 `.gitignore`。
+//! - `hidden` (bool, 可选, 默认 `false`) — 是否搜索隐藏目录（`.latte/` `.git/` 等）。
+//!   把隐藏目录直接作为 `paths` 目标时不受此开关影响。
 //! - `skip` (number, 可选, 默认 `0`) — 跳过前 N 个有命中的文件，用于分页。
 //! - `limit` (number, 可选, 默认 100, 上限 500) — 单文件最多返回的匹配行数。
+//!
+//! 另有一个不可配置的总字节上限（100KB，作用于分页后的 matches 文本总量）：
+//! 超过即停止追加并置 `truncated: true`，防止多文件命中撑爆 agent context。
 //!
 //! ## 输出
 //!
@@ -101,6 +106,7 @@ fn prop(ty: PropertyType, description: &str) -> ToolInputProperty {
         maximum: None,
         min_length: None,
         max_length: None,
+        items: None, properties: None, required: None, additional_properties: None,
     }
 }
 
@@ -262,6 +268,12 @@ pub fn file_search_tool() -> Tool {
                 .get("gitignore")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
+            // 默认不扫隐藏目录（.latte/ .git/ 等运行时目录）；显式传 hidden:true 才扫。
+            // 注意：显式把隐藏目录本身作为 paths root（如 ".latte/logs"）不受此开关影响。
+            let include_hidden = input
+                .get("hidden")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             // 编译 regex。空 pattern 已在上一步拒绝；这里只处理非法 regex。
             //
@@ -395,7 +407,7 @@ pub fn file_search_tool() -> Tool {
                         let files: Vec<PathBuf> = if root.is_file() {
                             vec![root.clone()]
                         } else {
-                            walk_all_files(root, /* hidden */ true, use_gitignore)
+                            walk_all_files(root, include_hidden, use_gitignore)
                         };
                         for f in &files {
                             if let Some(m) = matcher.as_ref() {
@@ -490,7 +502,9 @@ pub fn file_search_tool() -> Tool {
 
             // --- 7. 组装结果 ---------------------------------------------
             // 总内容预算：海量命中（即使每行已截断）也会撑爆模型上下文。
-            // 超预算后丢弃后续命中、置 truncated，并按实际返回重算计数。
+            // 上限作用在分页之后：totalFileCount 仍是分页前的真实统计，只是
+            // 返回的 matches 被截断（不破坏 skip 翻页语义）。超预算后丢弃
+            // 后续命中、置 truncated，并按实际返回重算计数。
             let mut matches: Vec<Value> = Vec::with_capacity(scan_out.hits.len());
             let mut budget_left = MAX_TOTAL_CONTENT_BYTES;
             let mut kept_files: BTreeSet<String> = BTreeSet::new();
@@ -508,6 +522,7 @@ pub fn file_search_tool() -> Tool {
                     "content": h.content,
                 }));
             }
+            // fileCount / totalMatches 反映实际返回的内容（截断后）。
             let new_file_count = kept_files.len();
             let total_matches = matches.len();
 
@@ -533,13 +548,13 @@ pub fn file_search_tool() -> Tool {
     // `Path not found`。
     Tool::builder(
         "search",
-        "按正则（或 literal 字面量）搜索文件内容，返回 file:line + 命中行",
+        "按正则（或 literal 字面量）搜索文件内容，返回 file:line + 命中行。默认在项目根（.）递归搜索，跳过隐藏目录（.latte/ .git/ 等运行时目录）并尊重 .gitignore；如需搜隐藏目录传 hidden:true，或把该目录直接作为 paths 目标。强烈建议用 paths 限制搜索范围（如 src/ tests/）以控制返回量。支持按文件分页（skip）、每文件匹配上限（limit）与单次返回总字节上限（超出置 truncated）。",
         optional_required(
             vec![
                 (
                     "pattern",
                     PropertyType::String,
-                    "必填。regex 模式；配合 literal=true 时按字面量匹配",
+                    "必填。regex 模式；配合 literal=true 时按字面量匹配。大小写是否敏感由 i / ignoreCase 控制。",
                 ),
                 (
                     "literal",
@@ -553,13 +568,18 @@ pub fn file_search_tool() -> Tool {
                     "可选，string[]，默认 [\".\"]。搜索目标，每个元素可以是文件路径、\
                      目录路径（递归）或 glob（如 src/**/*.rs）。\
                      搜多个目录必须用数组：[\"include\", \"src\"]——\
-                     不要写成一个空格分隔的字符串",
+                     不要写成一个空格分隔的字符串。应显式限定到 src/ tests/ 等源码目录以控制返回量。",
                 ),
                 (
                     "path",
                     PropertyType::String,
                     "可选。单路径写法，等价于 paths: [该值]。只接受一个路径，\
                      不支持空格分隔多路径",
+                ),
+                (
+                    "hidden",
+                    PropertyType::Boolean,
+                    "是否搜索隐藏目录（.latte/ .git/ 等），默认 false。把隐藏目录直接作为 paths 目标时不受此开关影响。",
                 ),
                 (
                     "i",
@@ -587,6 +607,7 @@ pub fn file_search_tool() -> Tool {
         Arc::new(handler),
     )
     .concurrency_safe(true)
+    .strict(true)
     .timeout(SEARCH_TIMEOUT)
     .build()
 }
@@ -1177,5 +1198,85 @@ mod tests {
         );
         // 正常命中不受影响
         assert!(files.contains(&"README.md"), "files: {:?}", files);
+    }
+
+    /// 测试：默认不搜隐藏目录；hidden:true 时才搜。（.git/.latte 例外：
+    /// 两者永远跳过，由 search_never_enters_* 两条锁定。）
+    #[tokio::test]
+    async fn search_excludes_hidden_dirs_by_default() {
+        let dir = build_tree();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".hidden").join("logs")).unwrap();
+        fs::write(
+            root.join(".hidden").join("logs").join("run.log"),
+            "TODO hidden hit\n",
+        )
+        .unwrap();
+
+        // 默认：隐藏目录里的命中不应出现
+        let out = run_in(root.to_path_buf(), json!({ "pattern": "TODO" }))
+            .await
+            .unwrap();
+        let files: Vec<&str> = out["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["file"].as_str().unwrap())
+            .collect();
+        assert!(
+            !files.iter().any(|f| f.contains(".hidden")),
+            "files: {:?}",
+            files
+        );
+
+        // hidden:true → 能搜到
+        let out = run_in(
+            root.to_path_buf(),
+            json!({ "pattern": "TODO", "hidden": true }),
+        )
+        .await
+        .unwrap();
+        let files: Vec<&str> = out["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["file"].as_str().unwrap())
+            .collect();
+        assert!(
+            files.iter().any(|f| f.contains(".hidden")),
+            "files: {:?}",
+            files
+        );
+    }
+
+    /// 测试：把 .latte 显式作为 paths root 时，不受硬跳过影响。
+    #[tokio::test]
+    async fn search_hidden_dir_as_explicit_root_still_works() {
+        let dir = build_tree();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".latte").join("logs")).unwrap();
+        fs::write(
+            root.join(".latte").join("logs").join("run.log"),
+            "TODO hidden hit\n",
+        )
+        .unwrap();
+
+        let out = run_in(
+            root.to_path_buf(),
+            json!({ "pattern": "TODO", "paths": [".latte"] }),
+        )
+        .await
+        .unwrap();
+        let files: Vec<&str> = out["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["file"].as_str().unwrap())
+            .collect();
+        assert!(
+            files.iter().any(|f| f.contains(".latte")),
+            "files: {:?}",
+            files
+        );
     }
 }

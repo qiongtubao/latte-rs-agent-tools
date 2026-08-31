@@ -21,6 +21,7 @@ fn prop(ty: PropertyType, description: &str) -> ToolInputProperty {
         maximum: None,
         min_length: None,
         max_length: None,
+        items: None, properties: None, required: None, additional_properties: None,
     }
 }
 
@@ -322,6 +323,7 @@ fn shell_exec_tool() -> Tool {
         std::sync::Arc::new(handler),
     )
     .concurrency_safe(false)
+    .strict(true)
     .timeout(std::time::Duration::from_secs(300))
     .build()
 }
@@ -414,8 +416,9 @@ fn shell_spawn_tool() -> Tool {
         required(vec![("command", PropertyType::String, "命令")]),
         std::sync::Arc::new(handler),
     )
-    .concurrency_safe(false)
-    .timeout(std::time::Duration::from_secs(60))
+        .concurrency_safe(false)
+        .strict(true)
+        .timeout(std::time::Duration::from_secs(60))
     .build()
 }
 

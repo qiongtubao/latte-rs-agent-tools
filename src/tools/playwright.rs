@@ -15,7 +15,7 @@ use crate::error::ToolError;
 use crate::types::{PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema, ToolPackage};
 
 fn prop(ty: PropertyType, desc: &str) -> ToolInputProperty {
-    ToolInputProperty { property_type: ty, description: Some(desc.into()), enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None }
+    ToolInputProperty { property_type: ty, description: Some(desc.into()), enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None, items: None, properties: None, required: None, additional_properties: None }
 }
 
 fn all_props() -> ToolInputSchema {
@@ -61,7 +61,7 @@ fn screenshot_tool() -> Tool {
         }.boxed()
     });
 
-    Tool::builder("playwright_screenshot", "Take a screenshot of a web page using headless Chromium. Returns image dimensions and hex-encoded pixel data.", all_props(), handler)
+    Tool::builder("screenshot", "Take a screenshot of a web page using headless Chromium. Returns image dimensions and hex-encoded pixel data.", all_props(), handler)
         .concurrency_safe(true)
         .timeout(std::time::Duration::from_secs(30))
         .build()

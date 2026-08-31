@@ -1,5 +1,5 @@
 //! AST structural code search and replace tools.
-//! 提供 `ast_grep` 和 `ast_edit` 工具：基于 AST 模式的代码搜索和替换。
+//! 提供 `grep` 和 `ast_edit` 工具：基于 AST 模式的代码搜索和替换。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -12,11 +12,12 @@ use serde_json::{json, Value};
 
 use crate::error::ToolError;
 use crate::types::{
-    PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema, ToolPackage,
+    PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema,
+    ToolPackage,
 };
 
 fn prop(ty: PropertyType, description: &str) -> ToolInputProperty {
-    ToolInputProperty { property_type: ty, description: Some(description.into()), enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None }
+    ToolInputProperty { property_type: ty, description: Some(description.into()), enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None, items: None, properties: None, required: None, additional_properties: None }
 }
 
 fn ext_to_lang_str(ext: &str) -> &'static str {
@@ -148,7 +149,7 @@ fn ast_grep_tool() -> Tool {
                 let m = tokio::task::spawn_blocking({
                     let f = f.clone(); let pat = pat.clone(); let lo = lo.clone(); let cwd = cwd.clone();
                     move || search_file(&f, &pat, &lo, 0, limit, &cwd)
-                }).await.map_err(|e| ToolError::execution_str("ast_grep", format!("panic: {}", e)))?;
+                }).await.map_err(|e| ToolError::execution_str("grep", format!("panic: {}", e)))?;
                 let m = m.map_err(ToolError::other)?;
                 if !m.is_empty() { file_count += 1; all_matches.extend(m); }
             }
@@ -157,7 +158,7 @@ fn ast_grep_tool() -> Tool {
             Ok(json!({"matchCount": all.len(), "fileCount": file_count, "matches": all}))
         }.boxed()
     };
-    Tool::builder("ast_grep", "AST structural code search. 26+ languages. Use $NAME/$_ for one node, $$$NAME/$$$ for zero-or-more.", ast_grep_schema(), Arc::new(handler))
+    Tool::builder("grep", "AST structural code search. 26+ languages. Use $NAME/$_ for one node, $$$NAME/$$$ for zero-or-more.", ast_grep_schema(), Arc::new(handler))
         .concurrency_safe(true).timeout(std::time::Duration::from_secs(60)).build()
 }
 
@@ -208,7 +209,7 @@ mod tests {
     }
     async fn grep(pat: &str, path: &str) -> Value {
         let m = create_tool_manager(); m.register_package(AstToolsPackage::new()).await.unwrap();
-        m.execute("ast_grep", json!({"pat": pat, "paths": [path]}), None).await.unwrap()
+        m.execute("grep", json!({"pat": pat, "paths": [path]}), None).await.unwrap()
     }
     async fn edit(pat: &str, out: &str, path: &str) -> Value {
         let m = create_tool_manager(); m.register_package(AstToolsPackage::new()).await.unwrap();

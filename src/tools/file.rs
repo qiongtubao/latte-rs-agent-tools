@@ -20,6 +20,7 @@ fn prop(ty: PropertyType, description: &str) -> ToolInputProperty {
         maximum: None,
         min_length: None,
         max_length: None,
+        items: None, properties: None, required: None, additional_properties: None,
     }
 }
 
@@ -138,6 +139,25 @@ async fn list_directory(dir: &std::path::Path, path_str: &str) -> Result<Value, 
     }
     entries.sort();
     Ok(json!({"path": path_str, "isDirectory": true, "entries": entries, "entryCount": entries.len()}))
+}
+
+/// 把内容截断到 max_size（字符边界对齐）。返回 (内容, 是否截断)。
+/// maxSize 的语义是"返回内容上限"，不是"文件总大小硬校验"——
+/// 模型用它控制返回量，大文件应截断返回而不是报错（硬报错曾导致
+/// agent 对大文件反复调小 maxSize 连续失败）。
+fn truncate_to_max(content: &str, max_size: u64) -> (String, bool) {
+    if content.len() as u64 <= max_size {
+        return (content.to_string(), false);
+    }
+    let mut end = max_size as usize;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    (content[..end].to_string(), true)
+}
+
+fn truncated_note() -> &'static str {
+    "内容已按 maxSize 截断；需要更多内容时用行范围选择器分段读取（path:start-end 或 path:start+count）"
 }
 
 /// 读取文件，支持选择器。
@@ -434,7 +454,24 @@ fn summary_footer(read_path: &str, elided: &[ElidedRange], unit: &str) -> String
 async fn read_file_sel(path_buf: &std::path::Path, selector: Option<&str>, max_size: u64) -> Result<Value, ToolError> {
     let meta = fs::metadata(path_buf).await.map_err(|e| ToolError::execution_str("read", format!("stat: {}", e)))?;
     if !meta.is_file() { return Err(ToolError::other(format!("Not a file: {}", path_buf.display()))); }
-    if meta.len() > max_size { return Err(ToolError::other(format!("File too large: {} > {}", meta.len(), max_size))); }
+    // 运行时内部目录硬禁读：会话日志 / workflow checkpoint 是系统
+    // 自产物，agent 读它们只会自污染上下文（实际事故：agent 反复读
+    // 自己会话的实时日志，越读越大，14 连失败）。
+    {
+        let parts: Vec<String> = path_buf
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        let blocked = parts.windows(2).any(|w| {
+            w[0] == ".latte" && (w[1] == "ui-sessions" || w[1] == "workflow-runs")
+        });
+        if blocked {
+            return Err(ToolError::other(format!(
+                "系统运行时内部文件（{}），对 agent 不可读；如需排查运行状态请告知用户",
+                path_buf.display()
+            )));
+        }
+    }
     let bytes = fs::read(path_buf).await.map_err(|e| ToolError::execution_str("read", format!("read: {}", e)))?;
     let total_bytes = bytes.len() as u64;
     let content = String::from_utf8_lossy(&bytes).to_string();
@@ -447,15 +484,16 @@ async fn read_file_sel(path_buf: &std::path::Path, selector: Option<&str>, max_s
 
     if let Some(sel) = selector {
         if sel == "raw" {
-            return Ok(json!({"content": content, "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "encoding": "utf-8", "modifiedAt": modified, "selector": "raw", "tag": tag}));
+            let (content, truncated) = truncate_to_max(&content, max_size);
+            return Ok(json!({"content": content, "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "truncated": truncated, "note": if truncated { truncated_note() } else { "" }, "encoding": "utf-8", "modifiedAt": modified, "selector": "raw", "tag": tag}));
         }
         let (start_line, end_line) = parse_line_range(sel)?;
         if start_line > total_lines { return Err(ToolError::other(format!("start_line {} exceeds file length {}", start_line, total_lines))); }
         let end = end_line.min(total_lines);
         let selected: Vec<&str> = content.lines().skip(start_line - 1).take(end - start_line + 1).collect();
-        let selected_content = selected.join("\n");
-        let numbered: Vec<String> = selected.iter().enumerate().map(|(i, l)| format!("{}:{}", start_line + i, l)).collect();
-        return Ok(json!({"content": selected_content, "numberedContent": numbered.join("\n"), "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "startLine": start_line, "endLine": end, "selectedLines": selected.len(), "encoding": "utf-8", "modifiedAt": modified, "selector": sel, "tag": tag}));
+        let (selected_content, truncated) = truncate_to_max(&selected.join("\n"), max_size);
+        let numbered: Vec<String> = selected_content.lines().enumerate().map(|(i, l)| format!("{}:{}", start_line + i, l)).collect();
+        return Ok(json!({"content": selected_content, "numberedContent": numbered.join("\n"), "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "startLine": start_line, "endLine": end, "selectedLines": selected.len(), "truncated": truncated, "note": if truncated { truncated_note() } else { "" }, "encoding": "utf-8", "modifiedAt": modified, "selector": sel, "tag": tag}));
     }
     // 无选择器：读**代码**文件 → code-graph 结构摘要（签名+行号，折叠函数体）；
     // 读**文档**（.md/.markdown/.mdx/.txt）→ doc 大纲折叠（标题+行号，折叠正文）。
@@ -518,7 +556,8 @@ async fn read_file_sel(path_buf: &std::path::Path, selector: Option<&str>, max_s
         }
     }
 
-    Ok(json!({"content": content, "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "encoding": "utf-8", "modifiedAt": modified, "tag": tag}))
+    let (content, truncated) = truncate_to_max(&content, max_size);
+    Ok(json!({"content": content, "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "truncated": truncated, "note": if truncated { truncated_note() } else { "" }, "encoding": "utf-8", "modifiedAt": modified, "tag": tag}))
 }
 
 /// 批量读一次调用最多接受的路径数。
@@ -648,6 +687,13 @@ pub fn file_read_tool() -> Tool {
              返回 {files:[…], failed:[…]}，单个路径失败不影响其余。",
         ),
     );
+    props.insert(
+        "maxSize".to_string(),
+        prop(
+            PropertyType::Number,
+            "返回内容上限（字节），默认 10MB（10485760），超出截断返回（truncated=true），不报错。",
+        ),
+    );
     let schema = ToolInputSchema {
         schema_type: Default::default(),
         properties: props,
@@ -656,7 +702,9 @@ pub fn file_read_tool() -> Tool {
         required: None,
         additional_properties: None,
     };
-    Tool::builder("read", "读取文件内容。**多个文件一次读完**：把路径放进 paths 数组（一次最多 10 个），内部并发读、按输入顺序回传，不要逐个文件分开调用。单文件用 path。读代码文件且不带行范围时默认回传【结构摘要】：只列顶层定义的签名+行号、折叠函数体，末尾 footer 告诉你要看实现该重读哪几行。要整文件原文用 path:raw；要某段实现用 path:start-end / path:start+count。也支持读取目录列表。", schema, std::sync::Arc::new(handler))
+    // 注意：不能开 strict——path/paths 是 oneOf 关系，strict 会要求两者
+    // 同时必填（agent-core 侧也会在包装时把 read 的 strict 重置为 None）。
+    Tool::builder("read", "读取文件内容。**多个文件一次读完**：把路径放进 paths 数组（一次最多 10 个），内部并发读、按输入顺序回传，不要逐个文件分开调用。单文件用 path。读代码文件且不带行范围时默认回传【结构摘要】：只列顶层定义的签名+行号、折叠函数体，末尾 footer 告诉你要看实现该重读哪几行。要整文件原文用 path:raw；要某段实现用 path:start-end / path:start+count。maxSize 是返回内容上限（默认 10MB），超出截断并在 truncated/note 字段说明，不会报错。也支持读取目录列表。注意：.latte/ 是系统运行时内部目录（会话日志、workflow checkpoint、任务看板数据），不要读取，除非用户明确要求。", schema, std::sync::Arc::new(handler))
         .concurrency_safe(true)
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -1392,5 +1440,49 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("/definitely/not/here.md"), "echo path: {}", msg);
         assert!(!msg.contains("cwd:"), "no cwd when unset: {}", msg);
+    }
+
+    /// maxSize 是"返回内容上限"：大文件不再报 File too large，
+    /// 而是截断返回并带 truncated=true + 提示 note。
+    #[tokio::test]
+    async fn test_read_max_size_truncates_instead_of_erroring() {
+        let big = "x".repeat(5000);
+        let (_dir, path) = setup_file(&big).await;
+        let m = create_tool_manager();
+        m.register_package(FileToolsPackage::new()).await.unwrap();
+        // 全量读 + 小 maxSize → 截断，不报错
+        let r = m
+            .execute("read", json!({"path": path, "maxSize": 1000}), None)
+            .await
+            .expect("大文件 + 小 maxSize 必须成功（截断）而不是报错");
+        assert_eq!(r["truncated"].as_bool(), Some(true));
+        assert_eq!(r["content"].as_str().unwrap().len(), 1000);
+        assert!(r["note"].as_str().unwrap().contains("截断"));
+        // 行范围选择器 + 小 maxSize 同样不再被文件总大小误杀
+        let r2 = m
+            .execute("read", json!({"path": format!("{path}:1+1"), "maxSize": 10}), None)
+            .await
+            .expect("行范围读取大文件必须成功");
+        assert_eq!(r2["selectedLines"].as_u64(), Some(1));
+        assert_eq!(r2["content"].as_str().unwrap().len(), 10);
+        assert_eq!(r2["truncated"].as_bool(), Some(true));
+    }
+
+    /// .latte/ui-sessions 与 .latte/workflow-runs 是系统运行时内部
+    /// 目录，对 agent 硬禁读。
+    #[tokio::test]
+    async fn test_read_blocks_latte_runtime_internals() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join(".latte").join("ui-sessions");
+        fs::create_dir_all(&sub).await.unwrap();
+        fs::write(sub.join("s.jsonl"), "{}").await.unwrap();
+        let p = sub.join("s.jsonl").to_string_lossy().to_string();
+        let m = create_tool_manager();
+        m.register_package(FileToolsPackage::new()).await.unwrap();
+        let err = m
+            .execute("read", json!({"path": p}), None)
+            .await
+            .expect_err("运行时内部文件必须被拒绝");
+        assert!(err.to_string().contains("系统运行时内部文件"), "{err}");
     }
 }
