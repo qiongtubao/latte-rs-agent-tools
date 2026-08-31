@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use crate::error::ToolError;
-use crate::types::{NamespaceConfig, PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema, ToolPackage};
+use crate::types::{PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema, ToolPackage};
 
 fn prop(ty: PropertyType, desc: &str) -> ToolInputProperty {
     ToolInputProperty { property_type: ty, description: Some(desc.into()), enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None }
@@ -97,7 +97,7 @@ impl PlaywrightToolsPackage {
         ToolPackage {
             name: "playwright".into(),
             version: Some("1.0.0".into()),
-            namespace: Some(NamespaceConfig { prefix: "playwright".into(), separator: '.', auto_prefix: true }),
+            namespace: None,
             description: Some("Playwright browser automation: screenshots and script execution".into()),
             dependencies: None,
             tools: vec![screenshot_tool(), script_tool()],

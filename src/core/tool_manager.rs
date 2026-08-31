@@ -176,7 +176,14 @@ impl ToolManager for ToolManagerImpl {
         }
         let resolved = match self.registry.resolve_tool_name(name) {
             Some(r) => r,
-            None => return Err(ToolError::tool_not_found(name)),
+            // 带上注册表快照：模型猜错工具名（`edit` vs `write`）时能从
+            // 报错里直接读到正确选项，而不是继续换名字试。
+            None => {
+                return Err(ToolError::tool_not_found_with_available(
+                    name,
+                    self.registry.get_tool_names(),
+                ))
+            }
         };
         let tool = resolved.tool.clone();
         let full_name = name.to_string();

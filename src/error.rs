@@ -6,12 +6,41 @@ use thiserror::Error;
 /// Result alias used throughout the crate.
 pub type ToolResult<T> = std::result::Result<T, ToolError>;
 
+/// `ToolNotFound` 的可用工具后缀。空列表 → 空串（保持旧报错文本不变，
+/// 老快照测试不受影响）。列表过长会截断：报错要能被模型读完，不是
+/// 倒一份注册表。
+fn fmt_available(available: &[String]) -> String {
+    if available.is_empty() {
+        return String::new();
+    }
+    const MAX_LISTED: usize = 24;
+    let mut names: Vec<&str> = available.iter().map(|s| s.as_str()).collect();
+    names.sort_unstable();
+    let shown = names.len().min(MAX_LISTED);
+    let mut s = format!(" — 可用工具：{}", names[..shown].join(", "));
+    if names.len() > shown {
+        s.push_str(&format!(" …（另有 {} 个）", names.len() - shown));
+    }
+    s.push_str("。请从这个列表里挑一个重试，不要再猜别的名字");
+    s
+}
+
 /// Base error type. Mirrors the TS `ToolError` hierarchy.
 #[derive(Debug, Error)]
 pub enum ToolError {
     /// Tool was not found in the registry.
-    #[error("Tool not found: {0}")]
-    ToolNotFound(String),
+    ///
+    /// `available` 是当次注册表里真实可用的工具名。带上它是为了让调用
+    /// 方（模型）能自纠：只说 "Tool not found: edit" 时，模型无从知道
+    /// 正确名字是 `write`，只会换个名字继续猜。空 vec = 调用点拿不到
+    /// 注册表快照，退回旧行为。
+    #[error("Tool not found: {name}{}", fmt_available(available))]
+    ToolNotFound {
+        /// 模型请求的工具名。
+        name: String,
+        /// 注册表中实际可用的工具名。
+        available: Vec<String>,
+    },
 
     /// A tool with this name is already registered.
     #[error("Tool already exists: {0}")]
@@ -204,7 +233,21 @@ impl ToolError {
 
     /// Tool not found.
     pub fn tool_not_found(name: impl Into<String>) -> Self {
-        Self::ToolNotFound(name.into())
+        Self::ToolNotFound {
+            name: name.into(),
+            available: Vec::new(),
+        }
+    }
+
+    /// Tool not found，附带注册表里真实可用的工具名供调用方自纠。
+    pub fn tool_not_found_with_available(
+        name: impl Into<String>,
+        available: Vec<String>,
+    ) -> Self {
+        Self::ToolNotFound {
+            name: name.into(),
+            available,
+        }
     }
 
     /// Tool already exists.
@@ -229,13 +272,48 @@ impl ToolError {
 }
 
 #[cfg(test)]
+mod available_tools_tests {
+    use super::*;
+
+    /// 不带 available 时报错文本保持原样（老调用点与既有断言不受影响）。
+    #[test]
+    fn no_available_keeps_legacy_message() {
+        let err = ToolError::tool_not_found("edit");
+        assert_eq!(err.to_string(), "Tool not found: edit");
+    }
+
+    /// 带 available 时列出可用工具，并明确要求从列表里挑——只报
+    /// "Tool not found" 时模型只会继续猜别的名字。
+    #[test]
+    fn available_tools_are_listed_and_sorted() {
+        let err = ToolError::tool_not_found_with_available(
+            "edit",
+            vec!["write".into(), "bash".into(), "read".into()],
+        );
+        let msg = err.to_string();
+        assert!(msg.starts_with("Tool not found: edit"), "{msg}");
+        assert!(msg.contains("bash, read, write"), "应排序后列出: {msg}");
+        assert!(msg.contains("不要再猜别的名字"), "{msg}");
+    }
+
+    /// 列表过长要截断：报错是给模型读的，不是倒一份注册表。
+    #[test]
+    fn long_available_list_is_capped() {
+        let many: Vec<String> = (0..80).map(|i| format!("tool_{i:02}")).collect();
+        let msg = ToolError::tool_not_found_with_available("edit", many).to_string();
+        assert!(msg.contains("另有 56 个"), "应标注省略数量: {msg}");
+        assert!(!msg.contains("tool_79"), "尾部应被截断: {msg}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn display_round_trip() {
-        let err = ToolError::tool_not_found("git.status");
-        assert_eq!(err.to_string(), "Tool not found: git.status");
+        let err = ToolError::tool_not_found("git_status");
+        assert_eq!(err.to_string(), "Tool not found: git_status");
     }
 
     #[test]

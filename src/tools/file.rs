@@ -440,10 +440,14 @@ async fn read_file_sel(path_buf: &std::path::Path, selector: Option<&str>, max_s
     let content = String::from_utf8_lossy(&bytes).to_string();
     let total_lines = content.lines().count();
     let modified = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(0);
+    // 内容快照 tag（全文，非选区）：把它带回 `edit` 就能让工具校验
+    // 「文件自本次 read 之后有没有被改过」，从而拒绝基于过期行号的编辑。
+    // 见 `crate::tools::edit` 顶部关于 hashline 移植的说明。
+    let tag = crate::tools::edit::content_tag(&content);
 
     if let Some(sel) = selector {
         if sel == "raw" {
-            return Ok(json!({"content": content, "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "encoding": "utf-8", "modifiedAt": modified, "selector": "raw"}));
+            return Ok(json!({"content": content, "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "encoding": "utf-8", "modifiedAt": modified, "selector": "raw", "tag": tag}));
         }
         let (start_line, end_line) = parse_line_range(sel)?;
         if start_line > total_lines { return Err(ToolError::other(format!("start_line {} exceeds file length {}", start_line, total_lines))); }
@@ -451,7 +455,7 @@ async fn read_file_sel(path_buf: &std::path::Path, selector: Option<&str>, max_s
         let selected: Vec<&str> = content.lines().skip(start_line - 1).take(end - start_line + 1).collect();
         let selected_content = selected.join("\n");
         let numbered: Vec<String> = selected.iter().enumerate().map(|(i, l)| format!("{}:{}", start_line + i, l)).collect();
-        return Ok(json!({"content": selected_content, "numberedContent": numbered.join("\n"), "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "startLine": start_line, "endLine": end, "selectedLines": selected.len(), "encoding": "utf-8", "modifiedAt": modified, "selector": sel}));
+        return Ok(json!({"content": selected_content, "numberedContent": numbered.join("\n"), "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "startLine": start_line, "endLine": end, "selectedLines": selected.len(), "encoding": "utf-8", "modifiedAt": modified, "selector": sel, "tag": tag}));
     }
     // 无选择器：读**代码**文件 → code-graph 结构摘要（签名+行号，折叠函数体）；
     // 读**文档**（.md/.markdown/.mdx/.txt）→ doc 大纲折叠（标题+行号，折叠正文）。
@@ -485,7 +489,8 @@ async fn read_file_sel(path_buf: &std::path::Path, selector: Option<&str>, max_s
                         "modifiedAt": modified,
                         "mode": "structural_summary",
                         "foldedDefinitions": folded,
-                        "elidedLines": elided_lines
+                        "elidedLines": elided_lines,
+                        "tag": tag
                     }));
                 }
             }
@@ -505,35 +510,227 @@ async fn read_file_sel(path_buf: &std::path::Path, selector: Option<&str>, max_s
                         "modifiedAt": modified,
                         "mode": "doc_outline",
                         "headings": headings,
-                        "elidedLines": elided_lines
+                        "elidedLines": elided_lines,
+                        "tag": tag
                     }));
                 }
             }
         }
     }
 
-    Ok(json!({"content": content, "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "encoding": "utf-8", "modifiedAt": modified}))
+    Ok(json!({"content": content, "path": path_buf.to_string_lossy(), "size": total_bytes, "totalLines": total_lines, "encoding": "utf-8", "modifiedAt": modified, "tag": tag}))
+}
+
+/// 批量读一次调用最多接受的路径数。
+///
+/// 上限存在的理由是 token 而不是性能：一次回传 N 个文件的结构摘要，N 大了
+/// 会把上下文吃光，而上下文膨胀本身就会让后续每一轮变慢（jemalloc 会话实测
+/// 443KB 工具结果回喂，平均模型延迟从 1.92s 涨到 2.97s）。超过上限直接报错
+/// 让模型分批，而不是静默截断——静默截断会让模型以为它读全了。
+const READ_BATCH_MAX_PATHS: usize = 10;
+
+/// 批量读回传内容的总字节预算。按**输入顺序**累加，超预算的文件不回传内容、
+/// 转进 `failed` 并说明原因，让模型知道该单独重读哪些。
+const READ_BATCH_BYTE_BUDGET: usize = 192 * 1024;
+
+/// 批量读的并发上限。
+///
+/// 复用 agent 侧只读并发的两个环境变量，避免同一个概念出现两个旋钮：
+/// - `LATTE_AGENT_READONLY_PARALLEL=0/false/no/off` → 退回串行（上限 1）；
+/// - `LATTE_AGENT_READONLY_PARALLEL_MAX` → in-flight 上限，默认 8，钳 `1..=32`。
+fn read_batch_concurrency() -> usize {
+    let disabled = std::env::var("LATTE_AGENT_READONLY_PARALLEL")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(false);
+    if disabled {
+        return 1;
+    }
+    std::env::var("LATTE_AGENT_READONLY_PARALLEL_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(8)
+        .clamp(1, 32)
+}
+
+/// 读一个路径规格（可带 `:N-M` / `:raw` 选择器，也可以是目录）。
+///
+/// 单路径与批量走的是**同一个**函数，所以批量里每个文件的返回结构与单文件
+/// 调用逐字段一致——这一点是 `edit_anchor` 台账能逐条 fan-out 的前提。
+///
+/// 参数取**所有权**（而非借用）是刻意的：批量路径要把这些 future 交给
+/// `buffered` 并发轮询，借用版本会让闭包需要 HRTB、`.boxed()` 到
+/// `BoxFuture<'static>` 时推不出来。
+async fn read_one_spec(
+    spec: String,
+    max_size: u64,
+    ctx: ToolExecutionContext,
+) -> Result<Value, ToolError> {
+    let (file_path, selector) = parse_path_selector(&spec);
+    let path_buf = resolve_tool_path(file_path, &ctx);
+    let meta = fs::metadata(&path_buf)
+        .await
+        .map_err(|e| stat_error("read", &path_buf, &ctx, &e))?;
+    if meta.is_dir() {
+        return list_directory(&path_buf, &spec).await;
+    }
+    read_file_sel(&path_buf, selector, max_size).await
 }
 
 /// Standalone `read` tool constructor.
 pub fn file_read_tool() -> Tool {
     let handler = |input: Value, ctx: ToolExecutionContext| {
         async move {
-            let path = input.get("path").and_then(|v| v.as_str()).ok_or_else(|| ToolError::other("path is required"))?;
             let max_size = input.get("maxSize").and_then(|v| v.as_u64()).unwrap_or(10 * 1024 * 1024);
-            let (file_path, selector) = parse_path_selector(path);
-            let path_buf = resolve_tool_path(file_path, &ctx);
-            let meta = fs::metadata(&path_buf).await.map_err(|e| stat_error("read", &path_buf, &ctx, &e))?;
-            if meta.is_dir() { return list_directory(&path_buf, path).await; }
-            let result = read_file_sel(&path_buf, selector, max_size).await?;
-            Ok(result)
+
+            // ── 批量读（paths 数组）─────────────────────────────────
+            //
+            // 一次调用读 N 个文件，N 次 I/O 并发跑。这是「减少模型往返」
+            // 的主力：jemalloc 会话里 185 次工具调用的真实 I/O 只占 18s，
+            // 却付了 577s 模型往返；把 4 个独立取证并成 1 次调用，省的是
+            // 3 次往返而不是 3 次 I/O。
+            //
+            // 与「让模型自己批量发 tool_calls」相比，这条路**不依赖模型
+            // 能力**——Anthropic 自己的 cookbook 也是这么建议的（模型
+            // 不肯发并行调用时，给它一个 batch 工具）。
+            if let Some(raw_paths) = input.get("paths") {
+                let arr = raw_paths.as_array().ok_or_else(|| {
+                    ToolError::other("paths must be an array of strings")
+                })?;
+                let mut specs: Vec<String> = Vec::with_capacity(arr.len());
+                for v in arr {
+                    let s = v.as_str().ok_or_else(|| {
+                        ToolError::other("paths must contain only strings")
+                    })?;
+                    if s.trim().is_empty() {
+                        return Err(ToolError::other("paths must not contain empty strings"));
+                    }
+                    specs.push(s.to_string());
+                }
+                if specs.is_empty() {
+                    return Err(ToolError::other("paths must not be empty"));
+                }
+                if specs.len() > READ_BATCH_MAX_PATHS {
+                    return Err(ToolError::other(format!(
+                        "too many paths: {} > {} — 分批调用（一次最多 {} 个）",
+                        specs.len(),
+                        READ_BATCH_MAX_PATHS,
+                        READ_BATCH_MAX_PATHS
+                    )));
+                }
+                return read_batch(specs, max_size, ctx).await;
+            }
+
+            // ── 单路径（历史形状，逐字段不变）──────────────────────
+            let path = input.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+                ToolError::other("path is required (或用 paths 数组批量读)")
+            })?;
+            read_one_spec(path.to_string(), max_size, ctx).await
         }.boxed()
     };
-    Tool::builder("read", "读取文件内容。读代码文件且不带行范围时默认回传【结构摘要】：只列顶层定义的签名+行号、折叠函数体，末尾 footer 告诉你要看实现该重读哪几行。要整文件原文用 path:raw；要某段实现用 path:start-end / path:start+count。也支持读取目录列表。", required(vec![("path", PropertyType::String, "文件路径。选择器：:N-M 行范围 / :N+count / :raw 整文件原文（跳过结构摘要）")]), std::sync::Arc::new(handler))
+    let mut props = BTreeMap::new();
+    props.insert(
+        "path".to_string(),
+        prop(
+            PropertyType::String,
+            "单个文件路径。选择器：:N-M 行范围 / :N+count / :raw 整文件原文（跳过结构摘要）",
+        ),
+    );
+    props.insert(
+        "paths".to_string(),
+        prop(
+            PropertyType::Array,
+            "批量读：路径数组（每项支持与 path 相同的选择器），一次最多 10 个。\
+             要读的文件相互独立时**优先用它**——一次调用读完，不要一个文件一次调用。\
+             返回 {files:[…], failed:[…]}，单个路径失败不影响其余。",
+        ),
+    );
+    let schema = ToolInputSchema {
+        schema_type: Default::default(),
+        properties: props,
+        // path / paths 二者其一，required 交给 handler 判——JSON Schema
+        // 的 oneOf 在本仓库的极简校验器里没有对应表达。
+        required: None,
+        additional_properties: None,
+    };
+    Tool::builder("read", "读取文件内容。**多个文件一次读完**：把路径放进 paths 数组（一次最多 10 个），内部并发读、按输入顺序回传，不要逐个文件分开调用。单文件用 path。读代码文件且不带行范围时默认回传【结构摘要】：只列顶层定义的签名+行号、折叠函数体，末尾 footer 告诉你要看实现该重读哪几行。要整文件原文用 path:raw；要某段实现用 path:start-end / path:start+count。也支持读取目录列表。", schema, std::sync::Arc::new(handler))
         .concurrency_safe(true)
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
 }
+
+/// 批量读的执行体：并发取内容，再按**输入顺序**套字节预算。
+///
+/// 三条语义，缺一条就会出问题：
+///
+/// 1. **部分失败不整体失败** —— 5 个路径里 1 个不存在，返回 4 个成功 +
+///    `failed` 里 1 条，工具整体 `Ok`。若沿用单文件的「读不到就 Err」，
+///    一个错路径会废掉同批 4 次有效读取，模型还得重发一整轮。
+/// 2. **顺序确定** —— `buffered` 按输入顺序产出（不是完成顺序），所以
+///    字节预算的裁剪结果与磁盘快慢无关，可复现、可测试。
+/// 3. **每项结构与单文件一致** —— 直接塞 `read_one_spec` 的原样返回值，
+///    这样 `edit_anchor` 逐条 fan-out 时不需要任何形状转换。
+async fn read_batch(
+    specs: Vec<String>,
+    max_size: u64,
+    ctx: ToolExecutionContext,
+) -> Result<Value, ToolError> {
+    use futures::stream::{self, StreamExt};
+
+    let cap = read_batch_concurrency();
+    // 闭包必须按值接 `String`：接 `&String` 会让它需要 HRTB（对任意两个
+    // 生命周期都成立），而 handler 最终要 `.boxed()` 成 `BoxFuture<'static>`，
+    // 推不出来直接编译失败（"implementation of FnOnce is not general enough"）。
+    let owned: Vec<String> = specs.clone();
+    let futs: Vec<_> = owned
+        .into_iter()
+        .map(|spec| read_one_spec(spec, max_size, ctx.clone()))
+        .collect();
+    let results: Vec<Result<Value, ToolError>> =
+        stream::iter(futs).buffered(cap).collect().await;
+
+    let mut files: Vec<Value> = Vec::new();
+    let mut failed: Vec<Value> = Vec::new();
+    let mut used = 0usize;
+    for (spec, r) in specs.iter().zip(results) {
+        match r {
+            Ok(v) => {
+                let size = v
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.len())
+                    // 目录列表没有 content，按序列化长度估。
+                    .unwrap_or_else(|| v.to_string().len());
+                // 第一个文件永远收下：否则单个超预算的大文件会让整批空转。
+                if !files.is_empty() && used + size > READ_BATCH_BYTE_BUDGET {
+                    failed.push(json!({
+                        "path": spec,
+                        "error": format!(
+                            "skipped: 批量字节预算 {} 已用尽（本文件 {} 字节）——单独重读它，或用行范围只取需要的部分",
+                            READ_BATCH_BYTE_BUDGET, size
+                        ),
+                    }));
+                    continue;
+                }
+                used += size;
+                files.push(v);
+            }
+            Err(e) => failed.push(json!({ "path": spec, "error": e.to_string() })),
+        }
+    }
+
+    Ok(json!({
+        "files": files,
+        "failed": failed,
+        "count": files.len(),
+        "failedCount": failed.len(),
+        "bytes": used,
+    }))
+}
+
 
 fn file_write_tool() -> Tool {
     let handler = |input: Value, _ctx: ToolExecutionContext| {
@@ -830,6 +1027,183 @@ mod tests {
         m.execute("read", json!({"path": path}), None).await.unwrap()
     }
 
+    /// 批量读的执行入口（走完整 ToolManager，含 schema 校验）。
+    async fn run_read_batch(paths: Vec<String>) -> Value {
+        let m = create_tool_manager();
+        m.register_package(FileToolsPackage::new()).await.unwrap();
+        m.execute("read", json!({ "paths": paths }), None).await.unwrap()
+    }
+
+    /// 造 n 个文件，返回 (tempdir, 路径列表)。内容各不相同，便于断言顺序。
+    async fn setup_files(n: usize) -> (TempDir, Vec<String>) {
+        let dir = TempDir::new().unwrap();
+        let mut paths = Vec::new();
+        for i in 0..n {
+            let p = dir.path().join(format!("f{i}.txt"));
+            fs::write(&p, format!("content-{i}\n")).await.unwrap();
+            paths.push(p.to_string_lossy().to_string());
+        }
+        (dir, paths)
+    }
+
+    /// 批量读：一次调用读 5 个文件，**按输入顺序**回传，每项结构与单文件
+    /// 调用一致。顺序是可测的核心保证——`buffered` 按输入顺序产出，不是
+    /// 完成顺序，所以结果与磁盘快慢无关。
+    #[tokio::test]
+    async fn batch_read_returns_all_files_in_input_order() {
+        let (_dir, paths) = setup_files(5).await;
+        let r = run_read_batch(paths.clone()).await;
+        assert_eq!(r["count"].as_u64().unwrap(), 5);
+        assert_eq!(r["failedCount"].as_u64().unwrap(), 0);
+        let files = r["files"].as_array().unwrap();
+        assert_eq!(files.len(), 5);
+        for (i, f) in files.iter().enumerate() {
+            assert_eq!(f["content"].as_str().unwrap(), format!("content-{i}\n"));
+            assert_eq!(f["path"].as_str().unwrap(), paths[i]);
+            // 单文件调用的字段都在（tag 是 edit 行号自愈的基准）。
+            assert!(f["tag"].is_string(), "每项必须带 tag");
+            assert!(f["totalLines"].is_number());
+        }
+    }
+
+    /// 批量读里选择器照常生效：每项都独立解析 `:N-M` / `:raw`。
+    #[tokio::test]
+    async fn batch_read_honors_per_path_selectors() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("a.txt");
+        fs::write(&p, "l1\nl2\nl3\nl4\n").await.unwrap();
+        let p = p.to_string_lossy().to_string();
+        let r = run_read_batch(vec![format!("{p}:2-3"), format!("{p}:raw")]).await;
+        let files = r["files"].as_array().unwrap();
+        assert_eq!(files[0]["startLine"].as_u64().unwrap(), 2);
+        assert!(files[0]["content"].as_str().unwrap().contains("l2"));
+        assert_eq!(files[1]["selector"].as_str().unwrap(), "raw");
+        assert_eq!(files[1]["content"].as_str().unwrap(), "l1\nl2\nl3\nl4\n");
+    }
+
+    /// 部分失败不整体失败：4 个成功 + 1 个坏路径进 `failed`，工具整体 Ok。
+    /// 若沿用单文件「读不到就 Err」的语义，一个错路径会废掉同批 4 次有效
+    /// 读取，模型还得重发一整轮——这正是本次改造要省掉的东西。
+    #[tokio::test]
+    async fn batch_read_partial_failure_keeps_successes() {
+        let (dir, mut paths) = setup_files(4).await;
+        paths.insert(2, dir.path().join("nope.txt").to_string_lossy().to_string());
+        let r = run_read_batch(paths).await;
+        assert_eq!(r["count"].as_u64().unwrap(), 4, "4 个成功必须保留");
+        assert_eq!(r["failedCount"].as_u64().unwrap(), 1);
+        let failed = r["failed"].as_array().unwrap();
+        assert!(failed[0]["path"].as_str().unwrap().ends_with("nope.txt"));
+        assert!(!failed[0]["error"].as_str().unwrap().is_empty());
+    }
+
+    /// 单路径调用的返回形状**逐字段不变**：不包 `files`，直接是文件对象。
+    /// 这条锁住向后兼容——UI 渲染、`edit_anchor`、各处消费方都依赖它。
+    #[tokio::test]
+    async fn single_path_read_shape_is_unchanged() {
+        let (_dir, path) = setup_file("hello\n").await;
+        let r = run_read(&path).await;
+        assert!(r.get("files").is_none(), "单路径不得包成 files 数组");
+        assert_eq!(r["content"].as_str().unwrap(), "hello\n");
+        assert_eq!(r["path"].as_str().unwrap(), path);
+    }
+
+    /// 路径数超上限直接报错（而不是静默截断）——静默截断会让模型以为
+    /// 它读全了，然后基于不完整信息下结论。
+    #[tokio::test]
+    async fn batch_read_rejects_too_many_paths() {
+        let (_dir, paths) = setup_files(READ_BATCH_MAX_PATHS + 1).await;
+        let m = create_tool_manager();
+        m.register_package(FileToolsPackage::new()).await.unwrap();
+        let err = m.execute("read", json!({ "paths": paths }), None).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("too many paths"), "got: {msg}");
+    }
+
+    /// 字节预算：超预算的文件转进 `failed`，但**第一个文件永远收下**
+    /// （否则单个超预算的大文件会让整批空转）。裁剪按输入顺序进行，
+    /// 与完成顺序无关，所以结果可复现。
+    #[tokio::test]
+    async fn batch_read_byte_budget_trims_deterministically() {
+        let dir = TempDir::new().unwrap();
+        let big = "x".repeat(READ_BATCH_BYTE_BUDGET);
+        let mut paths = Vec::new();
+        for i in 0..3 {
+            let p = dir.path().join(format!("big{i}.txt"));
+            fs::write(&p, &big).await.unwrap();
+            paths.push(format!("{}:raw", p.to_string_lossy()));
+        }
+        let r = run_read_batch(paths).await;
+        assert_eq!(r["count"].as_u64().unwrap(), 1, "只有第一个进 files");
+        assert_eq!(r["failedCount"].as_u64().unwrap(), 2);
+        for f in r["failed"].as_array().unwrap() {
+            assert!(
+                f["error"].as_str().unwrap().contains("预算"),
+                "失败原因要讲清是预算而非文件坏了"
+            );
+        }
+    }
+
+    /// 两个会改 `LATTE_AGENT_READONLY_PARALLEL*` 的测试之间的互斥锁。
+    /// 环境变量是进程级共享状态，cargo 默认多线程跑测试，不加锁两者会互相
+    /// 掀桌子（一个刚 set，另一个 remove）。
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 并发上限的环境变量语义：默认 8；`_MAX` 覆盖并钳在 1..=32；
+    /// `LATTE_AGENT_READONLY_PARALLEL=0` 一票退回串行。
+    /// 与 agent 侧只读并发复用同一组旋钮，不引入第二个概念。
+    #[test]
+    fn read_batch_concurrency_reads_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LATTE_AGENT_READONLY_PARALLEL");
+        std::env::remove_var("LATTE_AGENT_READONLY_PARALLEL_MAX");
+        assert_eq!(read_batch_concurrency(), 8);
+        std::env::set_var("LATTE_AGENT_READONLY_PARALLEL_MAX", "100");
+        assert_eq!(read_batch_concurrency(), 32, "钳到上界");
+        std::env::set_var("LATTE_AGENT_READONLY_PARALLEL_MAX", "0");
+        assert_eq!(read_batch_concurrency(), 1, "钳到下界");
+        std::env::set_var("LATTE_AGENT_READONLY_PARALLEL_MAX", "4");
+        assert_eq!(read_batch_concurrency(), 4);
+        std::env::set_var("LATTE_AGENT_READONLY_PARALLEL", "off");
+        assert_eq!(read_batch_concurrency(), 1, "总开关关掉即串行");
+        std::env::remove_var("LATTE_AGENT_READONLY_PARALLEL");
+        std::env::remove_var("LATTE_AGENT_READONLY_PARALLEL_MAX");
+    }
+
+    /// 并发是真的：8 个 1MB 文件的批量读，墙钟必须短于把上限压到 1 的串行版。
+    /// 小文件读太快、差异会被噪声吃掉，所以刻意用 1MB 量级把单次 I/O 拉长。
+    #[tokio::test]
+    async fn batch_read_is_actually_concurrent() {
+        use std::time::Instant;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().unwrap();
+        let blob = "y".repeat(1024 * 1024);
+        let mut paths = Vec::new();
+        for i in 0..8 {
+            let p = dir.path().join(format!("blob{i}.txt"));
+            fs::write(&p, &blob).await.unwrap();
+            paths.push(format!("{}:raw", p.to_string_lossy()));
+        }
+        let ctx = ToolExecutionContext::fresh("read", 0);
+
+        std::env::set_var("LATTE_AGENT_READONLY_PARALLEL", "0");
+        let t = Instant::now();
+        let serial = read_batch(paths.clone(), 10 * 1024 * 1024, ctx.clone()).await.unwrap();
+        let serial_us = t.elapsed().as_micros();
+
+        std::env::remove_var("LATTE_AGENT_READONLY_PARALLEL");
+        let t = Instant::now();
+        let parallel = read_batch(paths.clone(), 10 * 1024 * 1024, ctx).await.unwrap();
+        let parallel_us = t.elapsed().as_micros();
+
+        // 两种模式的**结果**必须一致（字节预算下只有第一个进 files）。
+        assert_eq!(serial["count"], parallel["count"]);
+        assert_eq!(serial["failedCount"], parallel["failedCount"]);
+        assert!(
+            parallel_us < serial_us,
+            "并发({parallel_us}µs)应快于串行({serial_us}µs)"
+        );
+    }
+
     #[tokio::test]
     async fn test_read_selector_range() {
         let (_dir, path) = setup_file("line1\nline2\nline3\nline4\nline5\n").await;
@@ -1020,5 +1394,3 @@ mod tests {
         assert!(!msg.contains("cwd:"), "no cwd when unset: {}", msg);
     }
 }
-
-

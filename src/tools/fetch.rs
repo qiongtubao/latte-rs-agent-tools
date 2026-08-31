@@ -1,7 +1,7 @@
 //! HTTP fetch tool package. Mirrors the `fetch` tool in oh-my-pi/coding-agent.
 //!
-//! 提供 `http.fetch` 工具：发起 HTTP/HTTPS 请求并返回响应内容。
-//! 与 `shell.exec`（走 shell）不同，本工具直接通过 `reqwest` 发起请求，
+//! 提供 `fetch` 工具：发起 HTTP/HTTPS 请求并返回响应内容。
+//! 与 `bash`（走 shell）不同，本工具直接通过 `reqwest` 发起请求，
 //! 适用于 agent 需要联网拉取文档 / 调 API 的场景。
 //!
 //! ## 输入
@@ -165,7 +165,7 @@ fn is_text_mime(mime: &str) -> bool {
 /// 构造一个 `reqwest::Client`，按本次调用配置超时与跳转策略。
 fn build_client(timeout: Duration, follow_redirects: bool) -> Result<Client, crate::error::ToolError> {
     let mut builder = ClientBuilder::new()
-        .user_agent("latte-rs-agent-tools/0.1 (http.fetch)")
+        .user_agent("latte-rs-agent-tools/0.1 (fetch)")
         .timeout(timeout)
         .connect_timeout(timeout.min(Duration::from_secs(10)));
     // 默认跟随最多 10 次重定向；如关闭则直接拒绝任何 3xx。
@@ -176,7 +176,7 @@ fn build_client(timeout: Duration, follow_redirects: bool) -> Result<Client, cra
     };
     builder
         .build()
-        .map_err(|e| crate::error::ToolError::execution_str("http.fetch", format!("client build: {}", e)))
+        .map_err(|e| crate::error::ToolError::execution_str("fetch", format!("client build: {}", e)))
 }
 
 /// 标准化 HTTP 方法：接收 "GET"/"get"/"Get" 都能解析。
@@ -185,7 +185,7 @@ fn parse_method(s: &str) -> Result<Method, crate::error::ToolError> {
         .map_err(|e| crate::error::ToolError::other(format!("invalid http method '{}': {}", s, e)))
 }
 
-/// 构造 `http.fetch` 工具定义。
+/// 构造 `fetch` 工具定义。
 ///
 /// 输入 / 输出 schema 见模块级文档。
 pub fn http_fetch_tool() -> Tool {
@@ -251,9 +251,9 @@ pub fn http_fetch_tool() -> Tool {
             let started = Instant::now();
             let response = req.send().await.map_err(|e| {
                 if e.is_timeout() {
-                    crate::error::ToolError::timeout("http.fetch", timeout)
+                    crate::error::ToolError::timeout("fetch", timeout)
                 } else {
-                    crate::error::ToolError::execution("http.fetch", e)
+                    crate::error::ToolError::execution("fetch", e)
                 }
             })?;
             let final_url = response.url().to_string();
@@ -287,9 +287,9 @@ pub fn http_fetch_tool() -> Tool {
             let mut stream = response;
             while let Some(chunk) = stream.chunk().await.map_err(|e| {
                 if e.is_timeout() {
-                    crate::error::ToolError::timeout("http.fetch", timeout)
+                    crate::error::ToolError::timeout("fetch", timeout)
                 } else {
-                    crate::error::ToolError::execution("http.fetch", e)
+                    crate::error::ToolError::execution("fetch", e)
                 }
             })? {
                 if buf.len() + chunk.len() > max_size as usize {
@@ -357,21 +357,15 @@ pub fn http_fetch_tool() -> Tool {
 }
 
 /// `http` 工具包：目前只包含 `fetch` 一个工具。
-///
-/// 包名 `http` 会作为命名空间前缀，注册后工具的全名是 `http.fetch`。
 pub struct HttpToolsPackage;
 
 impl HttpToolsPackage {
-    /// 构造包（单个 `http.fetch` 工具）。
+    /// 构造包（单个 `fetch` 工具）。
     pub fn new() -> ToolPackage {
         ToolPackage {
             name: "http".into(),
             version: Some("1.0.0".into()),
-            namespace: Some(crate::types::NamespaceConfig {
-                prefix: "http".into(),
-                separator: '.',
-                auto_prefix: true,
-            }),
+            namespace: None,
             description: Some("HTTP 工具：发起 HTTP/HTTPS 请求".into()),
             dependencies: None,
             tools: vec![http_fetch_tool()],
@@ -459,7 +453,7 @@ mod tests {
     /// 把工具 handler 包成一个 `(input) -> Result<Value, ToolError>` 闭包。
     async fn run(input: Value) -> Result<Value, crate::error::ToolError> {
         let tool = http_fetch_tool();
-        let ctx = ToolExecutionContext::fresh("http.fetch", 0);
+        let ctx = ToolExecutionContext::fresh("fetch", 0);
         (tool.handler)(input, ctx).await
     }
 

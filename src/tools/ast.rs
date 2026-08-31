@@ -1,20 +1,18 @@
 //! AST structural code search and replace tools.
-//! 提供 `ast.grep` 和 `ast.edit` 工具：基于 AST 模式的代码搜索和替换。
+//! 提供 `ast_grep` 和 `ast_edit` 工具：基于 AST 模式的代码搜索和替换。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use ast_grep_core::source::Edit;
-use ast_grep_core::Matcher;
 use ast_grep_language::LanguageExt;
 use futures::FutureExt;
 use serde_json::{json, Value};
 
 use crate::error::ToolError;
 use crate::types::{
-    NamespaceConfig, PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema,
-    ToolPackage,
+    PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema, ToolPackage,
 };
 
 fn prop(ty: PropertyType, description: &str) -> ToolInputProperty {
@@ -150,7 +148,7 @@ fn ast_grep_tool() -> Tool {
                 let m = tokio::task::spawn_blocking({
                     let f = f.clone(); let pat = pat.clone(); let lo = lo.clone(); let cwd = cwd.clone();
                     move || search_file(&f, &pat, &lo, 0, limit, &cwd)
-                }).await.map_err(|e| ToolError::execution_str("ast.grep", format!("panic: {}", e)))?;
+                }).await.map_err(|e| ToolError::execution_str("ast_grep", format!("panic: {}", e)))?;
                 let m = m.map_err(ToolError::other)?;
                 if !m.is_empty() { file_count += 1; all_matches.extend(m); }
             }
@@ -159,7 +157,7 @@ fn ast_grep_tool() -> Tool {
             Ok(json!({"matchCount": all.len(), "fileCount": file_count, "matches": all}))
         }.boxed()
     };
-    Tool::builder("grep", "AST structural code search. 26+ languages. Use $NAME/$_ for one node, $$$NAME/$$$ for zero-or-more.", ast_grep_schema(), Arc::new(handler))
+    Tool::builder("ast_grep", "AST structural code search. 26+ languages. Use $NAME/$_ for one node, $$$NAME/$$$ for zero-or-more.", ast_grep_schema(), Arc::new(handler))
         .concurrency_safe(true).timeout(std::time::Duration::from_secs(60)).build()
 }
 
@@ -178,21 +176,21 @@ fn ast_edit_tool() -> Tool {
                 let r = tokio::task::spawn_blocking({
                     let f = f.clone(); let pat = pat.clone(); let out = out.clone(); let lo = lo.clone(); let cwd = cwd.clone();
                     move || edit_file(&f, &pat, &out, &lo, &cwd)
-                }).await.map_err(|e| ToolError::execution_str("ast.edit", format!("panic: {}", e)))?;
+                }).await.map_err(|e| ToolError::execution_str("ast_edit", format!("panic: {}", e)))?;
                 let r = r.map_err(ToolError::other)?;
                 if let Some(v) = r { total += v["replacements"].as_u64().unwrap_or(0) as usize; results.push(v); }
             }
             Ok(json!({"fileCount": results.len(), "totalReplacements": total, "replacements": results}))
         }.boxed()
     };
-    Tool::builder("edit", "AST structural code replace. Rewrites code matching `pat` to `out` using AST-aware replacement.", ast_edit_schema(), Arc::new(handler))
+    Tool::builder("ast_edit", "AST structural code replace. Rewrites code matching `pat` to `out` using AST-aware replacement.", ast_edit_schema(), Arc::new(handler))
         .concurrency_safe(false).timeout(std::time::Duration::from_secs(60)).build()
 }
 
 pub struct AstToolsPackage;
 impl AstToolsPackage {
     pub fn new() -> ToolPackage {
-        ToolPackage { name: "ast".into(), version: Some("1.0.0".into()), namespace: Some(NamespaceConfig { prefix: "ast".into(), separator: '.', auto_prefix: true }), description: Some("AST 结构代码搜索和替换工具".into()), dependencies: None, tools: vec![ast_grep_tool(), ast_edit_tool()], on_init: None, on_destroy: None, before_execute: None, after_execute: None, metadata: Some(json!({"category": "code", "tags": ["ast", "search", "replace"]})) }
+        ToolPackage { name: "ast".into(), version: Some("1.0.0".into()), namespace: None, description: Some("AST 结构代码搜索和替换工具".into()), dependencies: None, tools: vec![ast_grep_tool(), ast_edit_tool()], on_init: None, on_destroy: None, before_execute: None, after_execute: None, metadata: Some(json!({"category": "code", "tags": ["ast", "search", "replace"]})) }
     }
 }
 impl Default for AstToolsPackage { fn default() -> Self { Self } }
@@ -210,11 +208,11 @@ mod tests {
     }
     async fn grep(pat: &str, path: &str) -> Value {
         let m = create_tool_manager(); m.register_package(AstToolsPackage::new()).await.unwrap();
-        m.execute("ast.grep", json!({"pat": pat, "paths": [path]}), None).await.unwrap()
+        m.execute("ast_grep", json!({"pat": pat, "paths": [path]}), None).await.unwrap()
     }
     async fn edit(pat: &str, out: &str, path: &str) -> Value {
         let m = create_tool_manager(); m.register_package(AstToolsPackage::new()).await.unwrap();
-        m.execute("ast.edit", json!({"pat": pat, "out": out, "paths": [path]}), None).await.unwrap()
+        m.execute("ast_edit", json!({"pat": pat, "out": out, "paths": [path]}), None).await.unwrap()
     }
 
     #[tokio::test]

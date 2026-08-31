@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use crate::types::{NamespaceConfig, PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema, ToolPackage};
+use crate::types::{PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema, ToolPackage};
 
 fn prop(ty: PropertyType, desc: &str) -> ToolInputProperty {
     ToolInputProperty { property_type: ty, description: Some(desc.into()), enum_values: None, minimum: None, maximum: None, min_length: None, max_length: None }
@@ -121,7 +121,7 @@ impl McpToolsPackage {
     pub fn new() -> ToolPackage {
         ToolPackage {
             name: "mcp".into(), version: Some("1.0.0".into()),
-            namespace: Some(NamespaceConfig { prefix: "mcp".into(), separator: '.', auto_prefix: true }),
+            namespace: None,
             description: Some("MCP protocol: connect to servers, list and call tools".into()),
             dependencies: None, tools: vec![mcp_list_tool(), mcp_connect_tool(), mcp_call_tool()],
             on_init: None, on_destroy: None, before_execute: None, after_execute: None,

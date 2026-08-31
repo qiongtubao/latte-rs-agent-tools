@@ -1,9 +1,9 @@
 //! Enhanced content search tool. Mirrors the `search` tool in oh-my-pi/coding-agent.
 //!
-//! 提供 `file.search` 工具：在文件内容中按正则搜索，支持多目标、glob 路径、gitignore 尊重、
+//! 提供 `search` 工具：在文件内容中按正则搜索，支持多目标、glob 路径、gitignore 尊重、
 //! 大小写不敏感、按文件分页（`skip`）、单文件匹配上限（`limit`）。
 //!
-//! 与项目里旧版 `file.search` 的区别：
+//! 与项目里旧版 `search` 的区别：
 //! - 旧版只有 `path`（单路径） + `filePattern`（文件名 glob） + `maxDepth`；本版用 `paths`
 //!   数组接管，三者都能用 glob 表达。
 //! - 旧版没有 `skip`，命中文件多了只能改 pattern；本版用 `skip` 翻页。
@@ -12,6 +12,9 @@
 //! ## 输入
 //!
 //! - `pattern` (string, 必填) — regex 模式。空字符串会报错。
+//! - `literal` (bool, 可选, 默认 `false`) — `pattern` 按字面量匹配（内部
+//!   `regex::escape` 后仍走 regex 引擎，`i` / 分页等语义不变）。搜代码
+//!   符号（`LOG(`、`foo[0]`）必须用它，否则按 regex 解析会报错或错配。
 //! - `paths` (string | string[], 可选, 默认 `["."]`) — 搜索目标。每个元素可以是：
 //!   - 字面文件路径（只搜这一个文件）
 //!   - 字面目录路径（递归搜整个目录）
@@ -37,12 +40,18 @@
 //!     { "file": "src/main.rs", "line": 12, "content": "// TODO: ..." },
 //!     { "file": "src/lib.rs",  "line": 3,  "content": "// TODO: ..." }
 //!   ],
-//!   "truncated": false,               // true 表示某些文件触发了 per-file limit
+//!   "truncated": false,               // true 表示触发了 per-file limit、单行截断或总量预算
 //!   "missingPaths": []                // 多目标调用时被跳过的缺失路径
 //! }
 //! ```
 //!
 //! 排序：按文件 path 字典序，再按行号升序——便于 agent 顺序阅读。
+//!
+//! 防爆保护（防止工具结果撑爆模型上下文）：
+//! - 单条命中行内容超过 [`MAX_LINE_CONTENT_CHARS`] 字符会被截断（jsonl
+//!   会话日志等文件单行可达数 MB）；
+//! - 当次返回的命中内容总量超过 [`MAX_TOTAL_CONTENT_BYTES`] 字节后丢弃
+//!   后续命中，并置 `truncated: true`。
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -64,6 +73,23 @@ const MAX_PER_FILE_LIMIT: u64 = 500;
 const DEFAULT_PER_FILE_LIMIT: u64 = 100;
 /// 整次扫描的硬超时：60 秒。
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// 单条命中行内容上限（字符数）。jsonl 会话日志等文件单行可达数 MB，
+/// 整行返回会直接撑爆模型上下文。
+const MAX_LINE_CONTENT_CHARS: usize = 500;
+/// 当次返回的命中内容总字节预算。超出后丢弃后续命中并置 `truncated`。
+const MAX_TOTAL_CONTENT_BYTES: usize = 100 * 1024;
+
+/// 截断过长的命中行内容，返回 (截断后文本, 是否发生了截断)。
+fn truncate_line_content(s: &str) -> (String, bool) {
+    if s.chars().count() <= MAX_LINE_CONTENT_CHARS {
+        return (s.to_string(), false);
+    }
+    let cut: String = s.chars().take(MAX_LINE_CONTENT_CHARS).collect();
+    (
+        format!("{cut}…[行过长已截断，共 {} 字符]", s.chars().count()),
+        true,
+    )
+}
 
 /// 把 `(name, type, desc)` 三元组转成 `ToolInputProperty`。
 fn prop(ty: PropertyType, description: &str) -> ToolInputProperty {
@@ -93,6 +119,45 @@ fn optional_required(
         required: Some(required.iter().map(|s| s.to_string()).collect()),
         additional_properties: None,
     }
+}
+
+/// 单路径输入 `"include src"` 这类「空格分隔多路径」误用的定向提示。
+///
+/// 动机：模型看到 `path` 是 string 就会把多个目录塞进一个字符串（jemalloc
+/// 实锤：architect 4 次 `path: "include src"`）。原来的 `Path not found:
+/// include src` 只说不存在，模型无从判断是路径拼错还是用法错，于是反复
+/// 换写法重试。这里在**确认每个空格分段都真实存在**时才改写报错——
+/// 避免把「路径里本来就带空格」的正常情况误导成用法错误。
+///
+/// 返回 `Some(提示文本)` 表示确诊误用；`None` 表示走原样报错。
+fn multi_path_misuse_hint(raw: &str, cwd: &std::path::Path) -> Option<String> {
+    let segs: Vec<&str> = raw.split_whitespace().collect();
+    if segs.len() < 2 {
+        return None;
+    }
+    let all_exist = segs.iter().all(|s| {
+        let (root, _) = split_glob(s);
+        let resolved = if root.is_absolute() {
+            root
+        } else {
+            cwd.join(&root)
+        };
+        resolved.exists()
+    });
+    if !all_exist {
+        return None;
+    }
+    let arr = segs
+        .iter()
+        .map(|s| format!("\"{}\"", s))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "Path not found: {raw} —— `path` 只接受单个路径，不支持空格分隔。\
+         这 {n} 个分段单独看都存在，你要搜的应该是多个目标：\
+         请改用 paths 数组重试 → \"paths\": [{arr}]",
+        n = segs.len()
+    ))
 }
 
 /// 解析 `paths` 字段为字符串列表。接受 string 或 array 两种形式。
@@ -172,7 +237,7 @@ struct ScanOutput {
     truncated: bool,
 }
 
-/// 构造 `file.search` 工具定义。
+/// 构造 `search` 工具定义。
 pub fn file_search_tool() -> Tool {
     let handler = |input: Value, ctx: ToolExecutionContext| {
         async move {
@@ -199,13 +264,43 @@ pub fn file_search_tool() -> Tool {
                 .unwrap_or(true);
 
             // 编译 regex。空 pattern 已在上一步拒绝；这里只处理非法 regex。
-            let re_pattern = if ignore_case {
-                format!("(?i){}", pattern)
+            //
+            // `literal: true` 走字面量匹配（内部转义后仍用 regex 引擎，
+            // 保留 `i` / 行号 / 分页等全部既有语义）。动机：搜代码符号
+            // 时 `LOG(`、`foo[0]`、`a.b` 这类输入按 regex 编译必然失败
+            // 或静默匹配错东西——jemalloc 实锤：programmer 搜 `LOG("`
+            // 直接吃到 `invalid regex: unclosed group`，白烧一轮。
+            let literal = input
+                .get("literal")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let base_pattern = if literal {
+                regex::escape(pattern)
             } else {
                 pattern.to_string()
             };
+            let re_pattern = if ignore_case {
+                format!("(?i){}", base_pattern)
+            } else {
+                base_pattern
+            };
             let re = Regex::new(&re_pattern).map_err(|e| {
-                crate::error::ToolError::other(format!("invalid regex '{}': {}", pattern, e))
+                // 非 literal 模式下把 `literal: true` 作为出路写进错误里：
+                // 模型拿到的原始报错只有 regex 语法细节，无从判断「我其实
+                // 想搜的是字面量」。
+                if literal {
+                    crate::error::ToolError::other(format!(
+                        "invalid regex '{}' (literal mode): {}",
+                        pattern, e
+                    ))
+                } else {
+                    crate::error::ToolError::other(format!(
+                        "invalid regex '{}': {}. \
+                         若本意是搜字面文本（含 ( ) [ ] . * ? + | \\ 等字符），\
+                         请重试并加上 \"literal\": true",
+                        pattern, e
+                    ))
+                }
             })?;
 
             // --- 2. 解析 paths（支持 string / array / 旧版 path 别名）-----
@@ -256,10 +351,10 @@ pub fn file_search_tool() -> Tool {
                 // root 不存在 → 单条报错 / 多条跳过。
                 if !resolved_root.exists() {
                     if is_single {
-                        return Err(crate::error::ToolError::other(format!(
-                            "Path not found: {}",
-                            raw
-                        )));
+                        return Err(crate::error::ToolError::other(
+                            multi_path_misuse_hint(raw, &cwd)
+                                .unwrap_or_else(|| format!("Path not found: {}", raw)),
+                        ));
                     }
                     missing_paths.push(raw.clone());
                     continue;
@@ -328,11 +423,12 @@ pub fn file_search_tool() -> Tool {
                                 .replace('\\', "/");
                             for ln in &line_hits {
                                 let line_idx = ln.saturating_sub(1);
-                                let text = lines
-                                    .get(line_idx)
-                                    .copied()
-                                    .unwrap_or("")
-                                    .to_string();
+                                let (text, trimmed) = truncate_line_content(
+                                    lines.get(line_idx).copied().unwrap_or(""),
+                                );
+                                if trimmed {
+                                    out.truncated = true;
+                                }
                                 out.hits.push(MatchHit {
                                     file: rel.clone(),
                                     line: *ln as u64,
@@ -348,13 +444,13 @@ pub fn file_search_tool() -> Tool {
             // --- 6. 收结果 + 分页 -----------------------------------------
             let scan_result = tokio::time::timeout(SEARCH_TIMEOUT, scan)
                 .await
-                .map_err(|_| crate::error::ToolError::timeout("file.search", SEARCH_TIMEOUT))?;
+                .map_err(|_| crate::error::ToolError::timeout("search", SEARCH_TIMEOUT))?;
             let mut scan_out = match scan_result {
                 Ok(Ok(s)) => s,
                 Ok(Err(msg)) => return Err(crate::error::ToolError::other(msg)),
                 Err(join) => {
                     return Err(crate::error::ToolError::execution_str(
-                        "file.search",
+                        "search",
                         format!("scan task panicked: {}", join),
                     ));
                 }
@@ -392,26 +488,28 @@ pub fn file_search_tool() -> Tool {
                 });
             }
 
-            // 重新统计分页后的 fileCount + totalMatches。
-            let mut new_files: BTreeSet<String> = BTreeSet::new();
-            for h in &scan_out.hits {
-                new_files.insert(h.file.clone());
-            }
-            let new_file_count = new_files.len();
-            let total_matches = scan_out.hits.len();
-
             // --- 7. 组装结果 ---------------------------------------------
-            let matches: Vec<Value> = scan_out
-                .hits
-                .into_iter()
-                .map(|h| {
-                    json!({
-                        "file": h.file,
-                        "line": h.line,
-                        "content": h.content,
-                    })
-                })
-                .collect();
+            // 总内容预算：海量命中（即使每行已截断）也会撑爆模型上下文。
+            // 超预算后丢弃后续命中、置 truncated，并按实际返回重算计数。
+            let mut matches: Vec<Value> = Vec::with_capacity(scan_out.hits.len());
+            let mut budget_left = MAX_TOTAL_CONTENT_BYTES;
+            let mut kept_files: BTreeSet<String> = BTreeSet::new();
+            let mut budget_truncated = false;
+            for h in scan_out.hits.into_iter() {
+                if h.content.len() > budget_left {
+                    budget_truncated = true;
+                    break;
+                }
+                budget_left -= h.content.len();
+                kept_files.insert(h.file.clone());
+                matches.push(json!({
+                    "file": h.file,
+                    "line": h.line,
+                    "content": h.content,
+                }));
+            }
+            let new_file_count = kept_files.len();
+            let total_matches = matches.len();
 
             Ok(json!({
                 "scopePath": scope_path,
@@ -421,22 +519,69 @@ pub fn file_search_tool() -> Tool {
                 "totalMatches": total_matches,
                 "filesSearched": scan_out.files_scanned,
                 "matches": matches,
-                "truncated": scan_out.truncated,
+                "truncated": scan_out.truncated || budget_truncated,
                 "missingPaths": missing_paths,
             }))
         }
         .boxed()
     };
 
+    // Schema 必须把**所有**实现支持的参数都声明出来：模型只能看到
+    // schema，看不到本文件顶部的模块文档。此前这里只声明了 `pattern`，
+    // 于是 `paths` 数组形同不存在——jemalloc 实锤：architect 连续 4 次
+    // 传 `path: "include src"`（想搜两个目录，只能靠猜），全部报
+    // `Path not found`。
     Tool::builder(
         "search",
-        "按正则搜索文件内容",
+        "按正则（或 literal 字面量）搜索文件内容，返回 file:line + 命中行",
         optional_required(
-            vec![(
-                "pattern",
-                PropertyType::String,
-                "regex 模式，必填",
-            )],
+            vec![
+                (
+                    "pattern",
+                    PropertyType::String,
+                    "必填。regex 模式；配合 literal=true 时按字面量匹配",
+                ),
+                (
+                    "literal",
+                    PropertyType::Boolean,
+                    "可选，默认 false。true = pattern 按字面文本匹配（自动转义）。\
+                     搜代码符号如 LOG( 、foo[0] 、a.b 时必须用这个，否则会被当 regex 解析而报错",
+                ),
+                (
+                    "paths",
+                    PropertyType::Array,
+                    "可选，string[]，默认 [\".\"]。搜索目标，每个元素可以是文件路径、\
+                     目录路径（递归）或 glob（如 src/**/*.rs）。\
+                     搜多个目录必须用数组：[\"include\", \"src\"]——\
+                     不要写成一个空格分隔的字符串",
+                ),
+                (
+                    "path",
+                    PropertyType::String,
+                    "可选。单路径写法，等价于 paths: [该值]。只接受一个路径，\
+                     不支持空格分隔多路径",
+                ),
+                (
+                    "i",
+                    PropertyType::Boolean,
+                    "可选，默认 false。大小写不敏感（别名 ignoreCase）",
+                ),
+                (
+                    "gitignore",
+                    PropertyType::Boolean,
+                    "可选，默认 true。是否尊重 .gitignore",
+                ),
+                (
+                    "skip",
+                    PropertyType::Integer,
+                    "可选，默认 0。跳过前 N 个有命中的文件，用于翻页（配合返回的 totalFileCount）",
+                ),
+                (
+                    "limit",
+                    PropertyType::Integer,
+                    "可选，默认 100，上限 500。单个文件最多返回的匹配行数",
+                ),
+            ],
             &["pattern"],
         ),
         Arc::new(handler),
@@ -446,7 +591,7 @@ pub fn file_search_tool() -> Tool {
     .build()
 }
 
-/// 把 `file.search` 注册到 `FileToolsPackage`。
+/// 把 `search` 注册到 `FileToolsPackage`。
 pub fn add_file_search(pkg: &mut ToolPackage) {
     pkg.tools.push(file_search_tool());
 }
@@ -503,7 +648,7 @@ mod tests {
 
     async fn run_in(cwd: PathBuf, input: Value) -> Result<Value, crate::error::ToolError> {
         let tool = file_search_tool();
-        let mut ctx = ToolExecutionContext::fresh("file.search", 0);
+        let mut ctx = ToolExecutionContext::fresh("search", 0);
         ctx.metadata = Some(json!({ "cwd": cwd.to_string_lossy() }));
         (tool.handler)(input, ctx).await
     }
@@ -743,6 +888,116 @@ mod tests {
         assert!(err.to_string().contains("invalid regex"));
     }
 
+    /// 测试：非法 regex 的报错必须把 `literal: true` 这条出路写出来。
+    /// 回归防线：模型只能从报错文本里学到修正手段。
+    #[tokio::test]
+    async fn search_invalid_regex_error_suggests_literal() {
+        let dir = build_tree();
+        let err = run_in(dir.path().to_path_buf(), json!({ "pattern": "LOG(\"" }))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("invalid regex"), "msg = {msg}");
+        assert!(msg.contains("literal"), "报错未提示 literal 出路: {msg}");
+    }
+
+    /// 测试：`literal: true` 让 regex 元字符按字面量匹配。
+    #[tokio::test]
+    async fn search_literal_mode_matches_metacharacters() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.c"),
+            "LOG(\"hit\");\nLOGX(\"miss\");\nfoo[0] = 1;\n",
+        )
+        .unwrap();
+
+        // 不加 literal：`LOG("` 是非法 regex，直接报错（现状）。
+        let err = run_in(dir.path().to_path_buf(), json!({ "pattern": "LOG(\"" }))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid regex"));
+
+        // 加 literal：命中且只命中字面量那一行。
+        let out = run_in(
+            dir.path().to_path_buf(),
+            json!({ "pattern": "LOG(\"", "literal": true }),
+        )
+        .await
+        .unwrap();
+        let lines: Vec<u64> = out["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["line"].as_u64().unwrap())
+            .collect();
+        assert_eq!(lines, vec![1], "literal 应只命中第 1 行: {out}");
+
+        // `foo[0]` 在 regex 下是字符类（匹配 "foo0"，本文件里没有）；
+        // literal 下应当命中第 3 行。
+        let out = run_in(
+            dir.path().to_path_buf(),
+            json!({ "pattern": "foo[0]", "literal": true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["totalMatches"].as_u64().unwrap(), 1, "{out}");
+
+        // literal 与 i 组合仍然生效：小写 `log("` 只有在忽略大小写时命中。
+        let out = run_in(
+            dir.path().to_path_buf(),
+            json!({ "pattern": "log(\"", "literal": true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out["totalMatches"].as_u64().unwrap(),
+            0,
+            "literal 不该忽略大小写: {out}"
+        );
+        let out = run_in(
+            dir.path().to_path_buf(),
+            json!({ "pattern": "log(\"", "literal": true, "i": true }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["totalMatches"].as_u64().unwrap(), 1, "{out}");
+    }
+
+    /// 测试：`path: "include src"`（空格分隔多路径）→ 报错要指出用法错误，
+    /// 并给出可直接照抄的 `paths` 数组。
+    #[tokio::test]
+    async fn search_space_separated_path_suggests_paths_array() {
+        let dir = build_tree();
+        let err = run_in(
+            dir.path().to_path_buf(),
+            json!({ "pattern": "TODO", "path": "src tests" }),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("不支持空格分隔"), "msg = {msg}");
+        assert!(
+            msg.contains("\"paths\": [\"src\", \"tests\"]"),
+            "未给出可照抄的数组: {msg}"
+        );
+    }
+
+    /// 测试：分段并非都存在时不误判为用法错误——路径里本来就带空格
+    /// （或真的拼错了）应保持原样 `Path not found`，不要给误导性建议。
+    #[tokio::test]
+    async fn search_space_in_path_is_not_misreported_as_misuse() {
+        let dir = build_tree();
+        let err = run_in(
+            dir.path().to_path_buf(),
+            json!({ "pattern": "TODO", "path": "src nope" }),
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Path not found"), "msg = {msg}");
+        assert!(!msg.contains("不支持空格分隔"), "误判为用法错误: {msg}");
+    }
+
     /// 测试：匹配项按 file 字典序、再按 line 升序排。
     #[tokio::test]
     async fn search_results_sorted_by_file_then_line() {
@@ -809,5 +1064,118 @@ mod tests {
         // 200 个匹配被截断到默认 100
         let matches = out["matches"].as_array().unwrap();
         assert_eq!(matches.len(), DEFAULT_PER_FILE_LIMIT as usize);
+    }
+
+    /// 测试：超长命中行被截断到 MAX_LINE_CONTENT_CHARS，并置 truncated。
+    /// （jsonl 会话日志单行可达数 MB，整行返回会撑爆模型上下文。）
+    #[tokio::test]
+    async fn search_long_line_content_is_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let long_line = format!("TODO {}", "x".repeat(MAX_LINE_CONTENT_CHARS * 10));
+        fs::write(root.join("long.rs"), format!("{long_line}\n")).unwrap();
+
+        let out = run_in(root.to_path_buf(), json!({ "pattern": "TODO" }))
+            .await
+            .unwrap();
+        assert_eq!(out["truncated"], true);
+        let matches = out["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        let content = matches[0]["content"].as_str().unwrap();
+        assert!(
+            content.chars().count() <= MAX_LINE_CONTENT_CHARS + 30,
+            "content len: {}",
+            content.chars().count()
+        );
+        assert!(content.contains("行过长已截断"), "content: {content}");
+    }
+
+    /// 测试：命中内容总量超预算后丢弃后续命中并置 truncated。
+    #[tokio::test]
+    async fn search_total_content_budget_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // 每行 ~400 字符（截断阈值内），行数足以超过 100KB 总预算。
+        let line = format!("// TODO {}", "y".repeat(400));
+        let mut content = String::new();
+        for _ in 0..500 {
+            content.push_str(&line);
+            content.push('\n');
+        }
+        fs::write(root.join("big.rs"), content).unwrap();
+
+        let out = run_in(
+            root.to_path_buf(),
+            json!({ "pattern": "TODO", "limit": 500 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["truncated"], true);
+        let matches = out["matches"].as_array().unwrap();
+        let total_bytes: usize = matches
+            .iter()
+            .map(|m| m["content"].as_str().unwrap().len())
+            .sum();
+        assert!(total_bytes <= MAX_TOTAL_CONTENT_BYTES, "total: {total_bytes}");
+        assert!(matches.len() < 500, "matches: {}", matches.len());
+        assert_eq!(out["totalMatches"].as_u64().unwrap(), matches.len() as u64);
+    }
+
+    /// 测试：`.git` 目录即使 hidden=true 也永远跳过。
+    #[tokio::test]
+    async fn search_never_enters_git_dir() {
+        let dir = build_tree();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".git").join("logs")).unwrap();
+        fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/TODO\n").unwrap();
+        fs::write(root.join(".git").join("logs").join("HEAD"), "TODO commit\n").unwrap();
+
+        let out = run_in(root.to_path_buf(), json!({ "pattern": "TODO" }))
+            .await
+            .unwrap();
+        let files: Vec<&str> = out["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["file"].as_str().unwrap())
+            .collect();
+        assert!(
+            !files.iter().any(|f| f.contains(".git")),
+            "files: {:?}",
+            files
+        );
+        // 正常命中不受影响
+        assert!(files.contains(&"README.md"), "files: {:?}", files);
+    }
+
+    /// 测试：`.latte` 运行时状态目录（ui-sessions / workflow-runs 日志）即使
+    /// hidden=true 也永远跳过——日志包含 agent 搜过的关键词，搜它会自引用污染。
+    #[tokio::test]
+    async fn search_never_enters_latte_dir() {
+        let dir = build_tree();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".latte").join("ui-sessions")).unwrap();
+        fs::write(
+            root.join(".latte").join("ui-sessions").join("ui-1-0.jsonl"),
+            "{\"type\":\"ToolUse\",\"args\":\"TODO\"\n",
+        )
+        .unwrap();
+
+        let out = run_in(root.to_path_buf(), json!({ "pattern": "TODO" }))
+            .await
+            .unwrap();
+        let files: Vec<&str> = out["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["file"].as_str().unwrap())
+            .collect();
+        assert!(
+            !files.iter().any(|f| f.contains(".latte")),
+            "files: {:?}",
+            files
+        );
+        // 正常命中不受影响
+        assert!(files.contains(&"README.md"), "files: {:?}", files);
     }
 }

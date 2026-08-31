@@ -58,7 +58,7 @@ fn required(props: Vec<(&str, PropertyType, &str)>) -> ToolInputSchema {
     schema_with_optional(props, Vec::new())
 }
 
-/// Default wall-clock timeout for `shell.exec`, in milliseconds. Mirrors the
+/// Default wall-clock timeout for `bash`, in milliseconds. Mirrors the
 /// bash tool's old 30s default — overridden by the schema's `timeout` field if
 /// the model asks for a longer cap, or by the env var
 /// `LATTE_AGENT_BASH_TIMEOUT_SECS` for operator-level caps.
@@ -73,7 +73,11 @@ fn default_exec_timeout_ms() -> u64 {
     let from_env = std::env::var("LATTE_AGENT_BASH_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok());
-    from_env.unwrap_or(300_000) // L1 = 300s (5 minutes), aligned with oh-my-pi bash.ts
+    // env var 单位是秒（变量名即 SECS），内部统一换算成毫秒——之前
+    // parse 完直接当毫秒返回，operator 设 300 实际只得到 300ms。
+    from_env
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(300_000) // L1 = 300s (5 minutes), aligned with oh-my-pi bash.ts
 }
 
 /// Strip a leading `cd <path> && ` from `command` when no explicit `cwd`
@@ -120,11 +124,15 @@ static BG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 fn shell_exec_tool() -> Tool {
     let handler = |input: Value, ctx: ToolExecutionContext| {
         async move {
-            let original = input
-                .get("command")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| crate::error::ToolError::other("command is required"))?
-                .to_string();
+            // `wait: true` 轮询后台 job 只需要 jobId，不需要 command——
+            // 后台启动的返回消息正是这么指引的（jemalloc 日志事故：模型
+            // 照指引传 {jobId, wait:true}，被 command 必填卡住两轮）。
+            let is_wait = input.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
+            let original = match input.get("command").and_then(|v| v.as_str()) {
+                Some(c) => c.to_string(),
+                None if is_wait => String::new(),
+                None => return Err(crate::error::ToolError::other("command is required")),
+            };
             // Resolve cwd in priority order:
             //   1. `input.cwd` (explicit) — wins outright
             //   2. leading `cd X &&` extract from command — sets cwd AND strips
@@ -144,9 +152,13 @@ fn shell_exec_tool() -> Tool {
                     .and_then(|v| v.as_str())
                     .map(String::from)
             });
+            // schema 的 `timeout` 单位是秒（描述如此，模型按秒传），这里
+            // 换算成毫秒——之前直接当毫秒用，模型传 300（想要 300s）实际
+            // 300ms 就被 kill（jemalloc 日志事故：编译循环连续 300ms 超时）。
             let timeout_ms = input
                 .get("timeout")
-                .and_then(|v| v.as_u64())
+                .and_then(|v| v.as_f64())
+                .map(|secs| (secs.max(0.0) * 1000.0) as u64)
                 .unwrap_or_else(default_exec_timeout_ms);
             let env_obj = input.get("env").and_then(|v| v.as_object()).cloned();
             let stdin_payload = input.get("stdin").and_then(|v| v.as_str()).map(String::from);
@@ -154,6 +166,11 @@ fn shell_exec_tool() -> Tool {
 
             // --- 后台执行模式 --------------------------------------------------
             if is_async {
+                if command.is_empty() {
+                    return Err(crate::error::ToolError::other(
+                        "command is required when async=true",
+                    ));
+                }
                 let mut cmd = Command::new("sh");
                 cmd.arg("-c").arg(&command);
                 if let Some(c) = cwd.as_deref() {
@@ -172,7 +189,7 @@ fn shell_exec_tool() -> Tool {
 
                 let mut child = cmd
                     .spawn()
-                    .map_err(|e| crate::error::ToolError::execution("shell.exec", e))?;
+                    .map_err(|e| crate::error::ToolError::execution("bash", e))?;
 
                 // 写 stdin
                 if let Some(payload) = stdin_payload {
@@ -190,12 +207,11 @@ fn shell_exec_tool() -> Tool {
                 return Ok(json!({
                     "jobId": job_key,
                     "status": "running",
-                    "message": format!("Background job {} started. Use shell.exec with `jobId: \"{}\"` and `wait: true` to get the result.", job_key, job_key),
+                    "message": format!("Background job {} started. Use bash with `jobId: \"{}\"` and `wait: true` to get the result.", job_key, job_key),
                 }));
             }
 
             // --- 等待后台 job --------------------------------------------------
-            let is_wait = input.get("wait").and_then(|v| v.as_bool()).unwrap_or(false);
             if is_wait {
                 let job_id = input
                     .get("jobId")
@@ -203,7 +219,7 @@ fn shell_exec_tool() -> Tool {
                     .ok_or_else(|| crate::error::ToolError::other("jobId is required when wait=true"))?;
 
                 let mut jobs = BG_JOBS.lock().await;
-                let mut child = jobs
+                let child = jobs
                     .remove(job_id)
                     .ok_or_else(|| crate::error::ToolError::other(format!("Job not found: {}", job_id)))?;
                 drop(jobs);
@@ -215,11 +231,11 @@ fn shell_exec_tool() -> Tool {
                 .await
                 .map_err(|_| {
                     crate::error::ToolError::timeout(
-                        "shell.exec",
+                        "bash",
                         std::time::Duration::from_millis(timeout_ms),
                     )
                 })?
-                .map_err(|e| crate::error::ToolError::execution("shell.exec", e))?;
+                .map_err(|e| crate::error::ToolError::execution("bash", e))?;
 
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -252,7 +268,7 @@ fn shell_exec_tool() -> Tool {
 
             let mut child = cmd
                 .spawn()
-                .map_err(|e| crate::error::ToolError::execution("shell.exec", e))?;
+                .map_err(|e| crate::error::ToolError::execution("bash", e))?;
 
             // 写 stdin
             if let Some(payload) = stdin_payload {
@@ -269,11 +285,11 @@ fn shell_exec_tool() -> Tool {
             .await
             .map_err(|_| {
                 crate::error::ToolError::timeout(
-                    "shell.exec",
+                    "bash",
                     std::time::Duration::from_millis(timeout_ms),
                 )
             })?
-            .map_err(|e| crate::error::ToolError::execution("shell.exec", e))?;
+            .map_err(|e| crate::error::ToolError::execution("bash", e))?;
 
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -288,17 +304,18 @@ fn shell_exec_tool() -> Tool {
         .boxed()
     };
     Tool::builder(
-        "exec",
+        "bash",
         "执行 shell 命令并返回输出。支持前台执行（默认）和后台执行（`async: true` 返回 jobId，之后用 `wait: true` + `jobId` 取结果）。支持 `stdin` 输入。支持 `cwd`、`timeout`、`env` 参数。",
         schema_with_optional(
-            vec![("command", PropertyType::String, "要执行的命令")],
+            vec![],
             vec![
+                ("command", PropertyType::String, "要执行的命令。前台执行或 `async: true` 时必填；`wait: true` 轮询后台 job 时不需要（只需 jobId）。"),
                 ("cwd", PropertyType::String, "工作目录。可选。如果 command 以 `cd X &&` 开头，会被自动提取。"),
                 ("timeout", PropertyType::Number, "超时（秒），默认 300s (L1)。命令超过这个时间会被 kill 掉。"),
                 ("env", PropertyType::Object, "额外的环境变量（key=value 字符串映射）"),
                 ("stdin", PropertyType::String, "标准输入内容（可选）"),
                 ("async", PropertyType::Boolean, "后台执行模式。设为 true 立即返回 jobId，不等待命令完成。"),
-                ("wait", PropertyType::Boolean, "等待后台 job 完成。需要配合 `jobId` 使用。"),
+                ("wait", PropertyType::Boolean, "等待后台 job 完成。需要配合 `jobId` 使用。此模式下不需要 `command`。"),
                 ("jobId", PropertyType::String, "后台 job ID。wait=true 时必填，指定要等待的 job。"),
             ],
         ),
@@ -357,7 +374,7 @@ fn shell_spawn_tool() -> Tool {
 
             let mut child = cmd
                 .spawn()
-                .map_err(|e| crate::error::ToolError::execution("shell.spawn", e))?;
+                .map_err(|e| crate::error::ToolError::execution("spawn", e))?;
 
             if let Some(payload) = stdin_payload.as_deref() {
                 if let Some(stdin) = child.stdin.as_mut() {
@@ -374,11 +391,11 @@ fn shell_spawn_tool() -> Tool {
             .await
             .map_err(|_| {
                 crate::error::ToolError::timeout(
-                    "shell.spawn",
+                    "spawn",
                     std::time::Duration::from_millis(timeout_ms),
                 )
             })?
-            .map_err(|e| crate::error::ToolError::execution("shell.spawn", e))?;
+            .map_err(|e| crate::error::ToolError::execution("spawn", e))?;
 
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -411,11 +428,7 @@ impl ShellToolsPackage {
         ToolPackage {
             name: "shell".into(),
             version: Some("1.0.0".into()),
-            namespace: Some(crate::types::NamespaceConfig {
-                prefix: "shell".into(),
-                separator: '.',
-                auto_prefix: true,
-            }),
+            namespace: None,
             description: Some("Shell 命令执行工具".into()),
             dependencies: None,
             tools: vec![shell_exec_tool(), shell_spawn_tool()],
@@ -431,5 +444,76 @@ impl ShellToolsPackage {
 impl Default for ShellToolsPackage {
     fn default() -> Self {
         Self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// timeout 参数单位是秒：timeout=1 跑 sleep 0.2 应成功（若被误当
+    /// 毫秒即 1ms，必超时）。jemalloc 日志事故：模型按 schema 描述传
+    /// timeout:300（想要 300s），实际 300ms 就被 kill。
+    #[tokio::test]
+    async fn exec_timeout_param_is_seconds() {
+        let tool = shell_exec_tool();
+        let ctx = ToolExecutionContext::fresh("bash", 0);
+        let out = (tool.handler)(
+            json!({"command": "sleep 0.2 && echo done", "timeout": 1}),
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["stdout"].as_str().unwrap().trim(), "done");
+    }
+
+    /// wait 轮询后台 job 不需要 command——后台启动的返回消息就是这么
+    /// 指引的（日志事故：模型照指引传 {jobId, wait:true} 被卡住两轮）。
+    #[tokio::test]
+    async fn exec_wait_without_command_polls_background_job() {
+        let tool = shell_exec_tool();
+        let ctx = ToolExecutionContext::fresh("bash", 0);
+        let start = (tool.handler)(
+            json!({"command": "sleep 0.1 && echo bgdone", "async": true}),
+            ctx,
+        )
+        .await
+        .unwrap();
+        let job = start["jobId"].as_str().unwrap().to_string();
+
+        let ctx2 = ToolExecutionContext::fresh("bash", 0);
+        let out = (tool.handler)(json!({"jobId": job, "wait": true}), ctx2)
+            .await
+            .unwrap();
+        assert_eq!(out["stdout"].as_str().unwrap().trim(), "bgdone");
+        assert_eq!(out["success"].as_bool(), Some(true));
+    }
+
+    /// 前台执行仍强制要求 command。
+    #[tokio::test]
+    async fn exec_foreground_still_requires_command() {
+        let tool = shell_exec_tool();
+        let ctx = ToolExecutionContext::fresh("bash", 0);
+        let err = (tool.handler)(json!({}), ctx).await.unwrap_err();
+        assert!(err.to_string().contains("command is required"), "{err}");
+    }
+
+    /// schema 层面：command 不在 required 里，{jobId, wait} 调用才能过
+    /// tool manager 的入参校验。
+    #[test]
+    fn exec_schema_command_is_optional() {
+        let tool = shell_exec_tool();
+        let required = tool.input_schema.required.unwrap_or_default();
+        assert!(
+            !required.contains(&"command".to_string()),
+            "required: {required:?}"
+        );
+        // wait/jobId/timeout 等属性仍在 properties 里（模型可见）。
+        for p in ["command", "wait", "jobId", "timeout"] {
+            assert!(
+                tool.input_schema.properties.contains_key(p),
+                "missing property: {p}"
+            );
+        }
     }
 }

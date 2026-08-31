@@ -13,7 +13,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
 
 use crate::error::ToolError;
-use crate::types::{NamespaceConfig, PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema, ToolPackage};
+use crate::types::{PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema, ToolPackage};
 
 static BROWSER_WORKER: LazyLock<Mutex<Option<BrowserWorker>>> = std::sync::LazyLock::new(|| Mutex::new(None));
 static REQ_ID: AtomicU64 = AtomicU64::new(1);
@@ -132,7 +132,7 @@ impl BrowserToolsPackage {
     pub fn new() -> ToolPackage {
         ToolPackage {
             name: "browser".into(), version: Some("1.0.0".into()),
-            namespace: Some(NamespaceConfig { prefix: "browser".into(), separator: '.', auto_prefix: true }),
+            namespace: None,
             description: Some("浏览器自动化工具".into()), dependencies: None,
             tools: vec![browser_tool()], on_init: None, on_destroy: None,
             before_execute: None, after_execute: None,
@@ -148,7 +148,7 @@ mod tests {
     async fn exec(action: &str, params: &Value) -> Value {
         let m = create_tool_manager(); m.register_package(BrowserToolsPackage::new()).await.unwrap();
         let mut p = params.clone(); p.as_object_mut().unwrap().insert("action".into(), json!(action));
-        m.execute("browser.browser", p, None).await.unwrap()
+        m.execute("browser", p, None).await.unwrap()
     }
     #[tokio::test] async fn test_browser_open_close() {
         let r = exec("open", &json!({"url":"about:blank","width":800,"height":600})).await;

@@ -519,11 +519,7 @@ impl TodoToolsPackage {
         ToolPackage {
             name: "todo".into(),
             version: Some("1.0.0".into()),
-            namespace: Some(crate::types::NamespaceConfig {
-                prefix: "todo".into(),
-                separator: '.',
-                auto_prefix: true,
-            }),
+            namespace: None,
             description: Some("Todo 列表管理（原子批量操作）".into()),
             dependencies: None,
             tools: vec![todo_tool()],

@@ -30,7 +30,7 @@
 //!
 //! // Execute a tool
 //! let result = manager
-//!     .execute("git.status", serde_json::json!({ "short": true }), None)
+//!     .execute("git_status", serde_json::json!({ "short": true }), None)
 //!     .await?;
 //! println!("{}", result);
 //! # Ok(())
