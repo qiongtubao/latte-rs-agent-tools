@@ -13,13 +13,14 @@ pub fn normalize_llm_args(args: &mut serde_json::Value, schema: &ToolInputSchema
     let Some(obj) = args.as_object_mut() else {
         return;
     };
-    normalize_object(obj, &schema.properties, schema.required.as_deref());
+    normalize_object(obj, &schema.properties, schema.required.as_deref(), true);
 }
 
 fn normalize_object(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     properties: &std::collections::BTreeMap<String, crate::types::ToolInputProperty>,
     required: Option<&[String]>,
+    trim_strings: bool,
 ) {
     // 可选字段的 null / "" → 删除。LLM 常用它们表示“不传”。
     if let Some(required) = required {
@@ -28,18 +29,21 @@ fn normalize_object(
         });
     }
 
-    // 所有对象层级都清理字符串外围空白；随后按声明递归处理已知字段。
-    for value in obj.values_mut() {
-        if let Some(text) = value.as_str() {
-            let trimmed = text.trim();
-            if trimmed.len() != text.len() {
-                *value = serde_json::Value::String(trimmed.to_string());
+    // 保持历史行为：仅顶层参数清理外围空白。递归对象里的字符串可能是
+    // edit 正文、命令片段或 env 值，前后空白/换行属于有效载荷，不能 trim。
+    if trim_strings {
+        for value in obj.values_mut() {
+            if let Some(text) = value.as_str() {
+                let trimmed = text.trim();
+                if trimmed.len() != text.len() {
+                    *value = serde_json::Value::String(trimmed.to_string());
+                }
             }
         }
     }
     for (key, property) in properties {
         if let Some(value) = obj.get_mut(key) {
-            normalize_property(value, property);
+            normalize_property(value, property, trim_strings);
         }
     }
 }
@@ -47,6 +51,7 @@ fn normalize_object(
 fn normalize_property(
     value: &mut serde_json::Value,
     schema: &crate::types::ToolInputProperty,
+    trim_strings: bool,
 ) {
     match schema.property_type {
         PropertyType::Array => {
@@ -71,7 +76,8 @@ fn normalize_property(
                         *item = serde_json::Value::String(text.to_string());
                     }
                 }
-                normalize_property(item, items);
+                // 数组元素是嵌套载荷；递归修正形状，但保留字符串字节。
+                normalize_property(item, items, false);
             }
         }
         PropertyType::Object => {
@@ -79,7 +85,7 @@ fn normalize_property(
                 return;
             };
             if let Some(properties) = &schema.properties {
-                normalize_object(object, properties, schema.required.as_deref());
+                normalize_object(object, properties, schema.required.as_deref(), false);
             }
             if let Some(crate::types::ToolAdditionalProperties::Schema(additional)) =
                 &schema.additional_properties
@@ -90,12 +96,12 @@ fn normalize_property(
                         .as_ref()
                         .is_none_or(|properties| !properties.contains_key(key))
                     {
-                        normalize_property(child, additional);
+                        normalize_property(child, additional, false);
                     }
                 }
             }
         }
-        PropertyType::String => {
+        PropertyType::String if trim_strings => {
             if let Some(text) = value.as_str() {
                 let trimmed = text.trim();
                 if trimmed.len() != text.len() {
@@ -279,6 +285,85 @@ mod tests {
         assert_eq!(args["options"][0]["pros"], json!(["fast\nsimple"]));
         assert_eq!(args["options"][0]["cons"], json!(["stateful"]));
         assert!(crate::utils::schema_validator::validate_input(&args, &schema).valid);
+    }
+
+    #[test]
+    fn test_recursive_literal_strings_preserve_whitespace() {
+        let literal = ToolInputProperty {
+            property_type: PropertyType::String,
+            description: None,
+            enum_values: None,
+            minimum: None,
+            maximum: None,
+            min_length: None,
+            max_length: None,
+            items: None,
+            properties: None,
+            required: None,
+            additional_properties: None,
+        };
+        let operation = ToolInputProperty {
+            property_type: PropertyType::Object,
+            description: None,
+            enum_values: None,
+            minimum: None,
+            maximum: None,
+            min_length: None,
+            max_length: None,
+            items: None,
+            properties: Some(BTreeMap::from([
+                ("old_text".into(), literal.clone()),
+                ("new_text".into(), literal.clone()),
+            ])),
+            required: None,
+            additional_properties: Some(false.into()),
+        };
+        let env = ToolInputProperty {
+            property_type: PropertyType::Object,
+            description: None,
+            enum_values: None,
+            minimum: None,
+            maximum: None,
+            min_length: None,
+            max_length: None,
+            items: None,
+            properties: None,
+            required: None,
+            additional_properties: Some(literal.into()),
+        };
+        let schema = ToolInputSchema {
+            schema_type: Default::default(),
+            properties: BTreeMap::from([
+                (
+                    "ops".into(),
+                    ToolInputProperty {
+                        property_type: PropertyType::Array,
+                        description: None,
+                        enum_values: None,
+                        minimum: None,
+                        maximum: None,
+                        min_length: None,
+                        max_length: None,
+                        items: Some(Box::new(operation)),
+                        properties: None,
+                        required: None,
+                        additional_properties: None,
+                    },
+                ),
+                ("env".into(), env),
+            ]),
+            required: Some(vec!["ops".into()]),
+            additional_properties: None,
+        };
+        let mut args = json!({
+            "ops": [{"old_text": "DROP_ME\n", "new_text": "    replacement"}],
+            "env": {"INDENT": "  preserved  "}
+        });
+        let original = args.clone();
+
+        normalize_llm_args(&mut args, &schema);
+
+        assert_eq!(args, original, "nested literal strings must stay byte-exact");
     }
 
     #[test]
