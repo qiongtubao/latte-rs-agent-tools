@@ -66,7 +66,12 @@ pub struct ToolInputProperty {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Optional enum of allowed values.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "enum",
+        alias = "enum_values",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub enum_values: Option<Vec<serde_json::Value>>,
     /// Minimum for numeric types.
     #[serde(default, skip_serializing_if = "Option::is_none")]

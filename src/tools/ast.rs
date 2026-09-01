@@ -47,7 +47,7 @@ fn infer_lang(path: &str) -> Result<ast_grep_language::SupportLang, ToolError> {
 fn ast_grep_schema() -> ToolInputSchema {
     let mut p = BTreeMap::new();
     p.insert("pat".into(), prop(PropertyType::String, "AST pattern. $NAME/$_ = one node, $$$NAME/$$$ = zero-or-more."));
-    p.insert("paths".into(), prop(PropertyType::Array, "Files, dirs, or globs."));
+    p.insert("paths".into(), prop(PropertyType::Array, "Files, dirs, or globs.").with_items(prop(PropertyType::String, "File, dir, or glob.")));
     p.insert("lang".into(), prop(PropertyType::String, "Language override."));
     p.insert("skip".into(), prop(PropertyType::Number, "Skip first N matches."));
     p.insert("limit".into(), prop(PropertyType::Number, "Max matches (default 100)."));
@@ -58,7 +58,7 @@ fn ast_edit_schema() -> ToolInputSchema {
     let mut p = BTreeMap::new();
     p.insert("pat".into(), prop(PropertyType::String, "AST pattern."));
     p.insert("out".into(), prop(PropertyType::String, "Replacement pattern."));
-    p.insert("paths".into(), prop(PropertyType::Array, "Files, dirs, or globs."));
+    p.insert("paths".into(), prop(PropertyType::Array, "Files, dirs, or globs.").with_items(prop(PropertyType::String, "File, dir, or glob.")));
     p.insert("lang".into(), prop(PropertyType::String, "Language override."));
     ToolInputSchema { schema_type: Default::default(), properties: p, required: Some(vec!["pat".into(), "out".into(), "paths".into()]), additional_properties: None }
 }

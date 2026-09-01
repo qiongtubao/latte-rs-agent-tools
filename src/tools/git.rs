@@ -14,7 +14,8 @@ use crate::types::{PropertyType, Tool, ToolExecutionContext, ToolInputProperty, 
 const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn prop(ty: PropertyType, description: &str) -> ToolInputProperty {
-    ToolInputProperty {
+    let is_array = ty == PropertyType::Array;
+    let property = ToolInputProperty {
         property_type: ty,
         description: Some(description.into()),
         enum_values: None,
@@ -23,6 +24,12 @@ fn prop(ty: PropertyType, description: &str) -> ToolInputProperty {
         min_length: None,
         max_length: None,
         items: None, properties: None, required: None, additional_properties: None,
+    };
+    // 数组必须带 items（OpenAI strict / schema 契约）。
+    if is_array {
+        property.with_items(prop(PropertyType::String, "数组元素"))
+    } else {
+        property
     }
 }
 

@@ -161,7 +161,17 @@ fn edit_schema() -> ToolInputSchema {
             maximum: None,
             min_length: None,
             max_length: None,
-            items: None, properties: None, required: None, additional_properties: None,
+            items: Some(Box::new(ToolInputProperty {
+                property_type: PropertyType::Object,
+                description: Some("One edit operation (line-based or text-based).".into()),
+                enum_values: None,
+                minimum: None,
+                maximum: None,
+                min_length: None,
+                max_length: None,
+                items: None, properties: None, required: None, additional_properties: None,
+            })),
+            properties: None, required: None, additional_properties: None,
         },
     );
     ToolInputSchema {
