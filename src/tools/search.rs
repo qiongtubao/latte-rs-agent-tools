@@ -23,8 +23,10 @@
 //! - `i` (bool, 可选, 默认 `false`) — 大小写不敏感。
 //! - `ignoreCase` (bool, 可选) — 旧版别名，等价于 `i`。
 //! - `gitignore` (bool, 可选, 默认 `true`) — 是否尊重 `.gitignore`。
-//! - `hidden` (bool, 可选, 默认 `false`) — 是否搜索隐藏目录（`.latte/` `.git/` 等）。
-//!   把隐藏目录直接作为 `paths` 目标时不受此开关影响。
+//! - `hidden` (bool, 可选, 默认 `false`) — 是否搜索普通隐藏目录。
+//!   `.git` / `.latte` 在普通递归扫描中始终剪枝；session/checkpoint 物理路径始终拒绝。
+//! - `diagnostic` (bool, 可选) — 用户明确要求排障时，与精确的
+//!   `paths: ["session://current"]` 配合，只搜索runner绑定的当前session文件。
 //! - `skip` (number, 可选, 默认 `0`) — 跳过前 N 个有命中的文件，用于分页。
 //! - `limit` (number, 可选, 默认 100, 上限 500) — 单文件最多返回的匹配行数。
 //!
@@ -69,6 +71,7 @@ use globset::Glob;
 use regex::Regex;
 use serde_json::{json, Value};
 
+use crate::tools::file::{current_session_path, is_protected_runtime_path, runtime_path_error, CURRENT_SESSION_URI};
 use crate::tools::find::walk_all_files;
 use crate::types::{PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema, ToolPackage};
 
@@ -362,24 +365,41 @@ pub fn file_search_tool() -> Tool {
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
             // --- 4. 解析 + 分流（missing / valid） -------------------------
+            let diagnostic = input.get("diagnostic").and_then(|v| v.as_bool()).unwrap_or(false);
             let is_single = raw_paths.len() == 1;
             let mut missing_paths: Vec<String> = Vec::new();
             // 把 (root, glob, original_input) 收集起来，下游统一扫描。
             let mut targets: Vec<(PathBuf, Option<Glob>, String)> = Vec::new();
             for raw in &raw_paths {
-                let (root, glob) = split_glob(raw);
-                let resolved_root = if root.is_absolute() {
-                    root.clone()
+                let (resolved_root, glob) = if raw == CURRENT_SESSION_URI {
+                    if !diagnostic {
+                        return Err(crate::error::ToolError::other(
+                            "搜索 session://current 仅用于用户明确要求的运行时排障；请设置 diagnostic=true",
+                        ));
+                    }
+                    (current_session_path(&ctx)?, None)
                 } else {
-                    cwd.join(&root)
+                    if raw.starts_with("session://") {
+                        return Err(crate::error::ToolError::other(format!(
+                            "不支持的内部 URI 或 URI glob：{raw}；只支持精确的 session://current"
+                        )));
+                    }
+                    let (root, glob) = split_glob(raw);
+                    let resolved = if root.is_absolute() { root } else { cwd.join(&root) };
+                    if is_protected_runtime_path(&resolved).await {
+                        return Err(runtime_path_error(&resolved));
+                    }
+                    (resolved, glob)
                 };
                 // root 不存在 → 单条报错 / 多条跳过。
                 if !resolved_root.exists() {
                     if is_single {
-                        return Err(crate::error::ToolError::other(
+                        return Err(crate::error::ToolError::other(if raw == CURRENT_SESSION_URI {
+                            format!("当前session已绑定到 {}，但已持久化transcript尚不存在", resolved_root.display())
+                        } else {
                             multi_path_misuse_hint(raw, &cwd)
-                                .unwrap_or_else(|| format!("Path not found: {}", raw)),
-                        ));
+                                .unwrap_or_else(|| format!("Path not found: {}", raw))
+                        }));
                     }
                     missing_paths.push(raw.clone());
                     continue;
@@ -561,7 +581,7 @@ pub fn file_search_tool() -> Tool {
     // `Path not found`。
     Tool::builder(
         "search",
-        "按正则（或 literal 字面量）搜索文件内容，返回 file:line + 命中行。默认在项目根（.）递归搜索，跳过隐藏目录（.latte/ .git/ 等运行时目录）并尊重 .gitignore；如需搜隐藏目录传 hidden:true，或把该目录直接作为 paths 目标。强烈建议用 paths 限制搜索范围（如 src/ tests/）以控制返回量。支持按文件分页（skip）、每文件匹配上限（limit）与单次返回总字节上限（超出置 truncated）。",
+        "按正则（或 literal 字面量）搜索文件内容，返回 file:line + 命中行。默认在项目根（.）递归搜索，walker阶段硬跳过 .latte/.git 并尊重 .gitignore；hidden:true 只开启普通隐藏目录，不能开启runtime session目录。系统运行时session/checkpoint的物理路径始终拒绝。仅当用户明确要求排障时可用 paths:[\"session://current\"] + diagnostic:true 搜索runner精确绑定的已持久化当前session，不扫描session目录、不按mtime猜测。强烈建议用 paths 限制源码搜索范围。支持按文件分页（skip）、每文件匹配上限（limit）与单次返回总字节上限（超出置 truncated）。",
         optional_required(
             vec![
                 (
@@ -592,7 +612,7 @@ pub fn file_search_tool() -> Tool {
                 (
                     "hidden",
                     PropertyType::Boolean,
-                    "是否搜索隐藏目录（.latte/ .git/ 等），默认 false。把隐藏目录直接作为 paths 目标时不受此开关影响。",
+                    "是否搜索普通隐藏目录，默认 false；.git与.latte walker硬剪枝，session/checkpoint物理路径无论此开关为何值都拒绝。",
                 ),
                 (
                     "i",
@@ -613,6 +633,11 @@ pub fn file_search_tool() -> Tool {
                     "limit",
                     PropertyType::Integer,
                     "可选，默认 100，上限 500。单个文件最多返回的匹配行数",
+                ),
+                (
+                    "diagnostic",
+                    PropertyType::Boolean,
+                    "仅当用户明确要求排查当前运行状态时设 true；配合 paths:[\"session://current\"] 只搜索runner精确绑定的当前session transcript。",
                 ),
             ],
             &["pattern"],
@@ -1195,7 +1220,7 @@ mod tests {
         )
         .unwrap();
 
-        let out = run_in(root.to_path_buf(), json!({ "pattern": "TODO" }))
+        let out = run_in(root.to_path_buf(), json!({ "pattern": "TODO", "hidden": true }))
             .await
             .unwrap();
         let files: Vec<&str> = out["matches"]
@@ -1262,9 +1287,10 @@ mod tests {
         );
     }
 
-    /// 测试：把 .latte 显式作为 paths root 时，不受硬跳过影响。
+    /// 测试：显式搜索 .latte 下的非runtime子目录仍可用；整个 .latte 根
+    /// 和 session/checkpoint 子目录则由 runtime 保护拒绝。
     #[tokio::test]
-    async fn search_hidden_dir_as_explicit_root_still_works() {
+    async fn search_non_runtime_hidden_subdir_as_explicit_root_still_works() {
         let dir = build_tree();
         let root = dir.path();
         fs::create_dir_all(root.join(".latte").join("logs")).unwrap();
@@ -1276,7 +1302,7 @@ mod tests {
 
         let out = run_in(
             root.to_path_buf(),
-            json!({ "pattern": "TODO", "paths": [".latte"] }),
+            json!({ "pattern": "TODO", "paths": [".latte/logs"] }),
         )
         .await
         .unwrap();
@@ -1291,5 +1317,58 @@ mod tests {
             "files: {:?}",
             files
         );
+    }
+
+    #[tokio::test]
+    async fn search_runtime_paths_require_exact_current_session_capability() {
+        let dir = build_tree();
+        let root = dir.path();
+        let sessions = root.join(".latte/ui-sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let a = sessions.join("a.jsonl");
+        let b = sessions.join("b.jsonl");
+        fs::write(&a, "NEEDLE_A\n").unwrap();
+        fs::write(&b, "NEEDLE_B\n").unwrap();
+        let err = run_in(root.to_path_buf(), json!({
+            "pattern": "NEEDLE", "paths": [".latte/ui-sessions"]
+        })).await.expect_err("physical runtime root must be rejected");
+        assert!(err.to_string().contains("不可直接访问"), "{err}");
+
+        let tool = file_search_tool();
+        let mut ctx_a = ToolExecutionContext::fresh("search", 0);
+        ctx_a.metadata = Some(json!({"cwd": root, "current_session_file": a}));
+        let mut ctx_b = ToolExecutionContext::fresh("search", 0);
+        ctx_b.metadata = Some(json!({"cwd": root, "current_session_file": b}));
+        let input = json!({"pattern": "NEEDLE", "paths": [CURRENT_SESSION_URI], "diagnostic": true});
+        let (a, b) = tokio::join!((tool.handler)(input.clone(), ctx_a), (tool.handler)(input, ctx_b));
+        assert_eq!(a.unwrap()["matches"][0]["file"], ".latte/ui-sessions/a.jsonl");
+        assert_eq!(b.unwrap()["matches"][0]["file"], ".latte/ui-sessions/b.jsonl");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_skips_symlink_to_runtime_session_file() {
+        let dir = build_tree();
+        let session = dir.path().join(".latte/ui-sessions/s.jsonl");
+        fs::create_dir_all(session.parent().unwrap()).unwrap();
+        fs::write(&session, "SYMLINK_SESSION_SECRET\n").unwrap();
+        std::os::unix::fs::symlink(&session, dir.path().join("safe-looking.jsonl")).unwrap();
+        let out = run_in(dir.path().to_path_buf(), json!({
+            "pattern": "SYMLINK_SESSION_SECRET", "hidden": true
+        })).await.unwrap();
+        assert_eq!(out["totalMatches"], 0, "{out}");
+    }
+
+    #[tokio::test]
+    async fn search_current_session_fails_closed_without_capability_or_exact_uri() {
+        let dir = build_tree();
+        let err = run_in(dir.path().to_path_buf(), json!({
+            "pattern": "TODO", "paths": [CURRENT_SESSION_URI], "diagnostic": true
+        })).await.expect_err("missing capability must fail closed");
+        assert!(err.to_string().contains("不会扫描 .latte"), "{err}");
+        let err = run_in(dir.path().to_path_buf(), json!({
+            "pattern": "TODO", "paths": ["session://current/**/*"], "diagnostic": true
+        })).await.expect_err("URI globs must be rejected");
+        assert!(err.to_string().contains("URI glob"), "{err}");
     }
 }

@@ -11,6 +11,7 @@ use futures::FutureExt;
 use serde_json::{json, Value};
 
 use crate::error::ToolError;
+use crate::tools::file::{is_protected_runtime_path_blocking, runtime_path_error};
 use crate::types::{
     PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema,
     ToolPackage,
@@ -66,15 +67,32 @@ fn ast_edit_schema() -> ToolInputSchema {
 fn collect_files(paths: &[String], cwd: &std::path::Path) -> Result<Vec<PathBuf>, ToolError> {
     let mut files: Vec<PathBuf> = Vec::new();
     for raw in paths {
+        if raw.starts_with("session://") {
+            return Err(ToolError::other(
+                "AST 工具不支持 session URI；排查当前会话内容请使用 read/search 的 session://current + diagnostic=true",
+            ));
+        }
         let p = if std::path::Path::new(raw).is_absolute() { PathBuf::from(raw) } else { cwd.join(raw) };
+        if is_protected_runtime_path_blocking(&p) {
+            return Err(runtime_path_error(&p));
+        }
         if p.is_file() { files.push(p); }
         else if p.is_dir() {
-            for e in walkdir::WalkDir::new(&p).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()) {
+            let walker = walkdir::WalkDir::new(&p).follow_links(false).into_iter().filter_entry(|e| {
+                e.path() == p || !(e.file_type().is_dir()
+                    && (e.file_name() == ".git" || e.file_name() == ".latte"))
+            });
+            for e in walker.filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()) {
                 let ep = e.path().to_path_buf();
+                if e.file_type().is_symlink() && is_protected_runtime_path_blocking(&ep) {
+                    continue;
+                }
                 if !ext_to_lang_str(ep.extension().and_then(|e| e.to_str()).unwrap_or("")).is_empty() { files.push(ep); }
             }
         } else {
-            for e in glob::glob(raw).map_err(|_| ToolError::other(format!("bad glob: {}", raw)))?.flatten() { if e.is_file() { files.push(e); } }
+            for e in glob::glob(raw).map_err(|_| ToolError::other(format!("bad glob: {}", raw)))?.flatten() {
+                if e.is_file() && !is_protected_runtime_path_blocking(&e) { files.push(e); }
+            }
         }
     }
     files.sort(); files.dedup(); Ok(files)
@@ -240,6 +258,27 @@ mod tests {
         assert!(r["totalReplacements"].as_u64().unwrap() >= 1);
         let content = std::fs::read_to_string(&p).unwrap();
         assert!(content.contains("new_name"));
+    }
+
+    #[tokio::test]
+    async fn ast_tools_prune_and_reject_runtime_paths() {
+        let dir = TempDir::new().unwrap();
+        let normal = w(&dir, "normal.rs", "fn visible() {}\n");
+        let session_dir = dir.path().join(".latte/ui-sessions");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let hidden = session_dir.join("leak.rs");
+        std::fs::write(&hidden, "fn session_secret() {}\n").unwrap();
+        let out = grep("fn $NAME() { $$$ }", dir.path().to_str().unwrap()).await;
+        assert_eq!(out["matchCount"], 1, "{out}");
+        assert!(out["matches"][0]["file"].as_str().unwrap().ends_with("normal.rs"));
+        assert!(std::path::Path::new(&normal).exists());
+
+        let m = create_tool_manager();
+        m.register_package(AstToolsPackage::new()).await.unwrap();
+        let err = m.execute("grep", json!({
+            "pat": "fn $NAME() { $$$ }", "paths": [hidden], "lang": "rust"
+        }), None).await.expect_err("direct runtime AST read must fail closed");
+        assert!(err.to_string().contains("不可直接访问"), "{err}");
     }
 
     #[tokio::test]

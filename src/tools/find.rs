@@ -47,6 +47,9 @@ use futures::FutureExt;
 use globset::Glob;
 use serde_json::{json, Value};
 
+use crate::tools::file::{
+    is_protected_runtime_path, is_protected_runtime_path_blocking, runtime_path_error,
+};
 use crate::types::{
     PropertyType, Tool, ToolExecutionContext, ToolInputProperty, ToolInputSchema, ToolPackage,
 };
@@ -236,6 +239,9 @@ pub(crate) fn walk_all_files(
         if entry.file_type().is_dir() {
             continue;
         }
+        if entry.file_type().is_symlink() && is_protected_runtime_path_blocking(path) {
+            continue;
+        }
         if !include_hidden && path_has_hidden_ancestor(path) {
             continue;
         }
@@ -368,12 +374,20 @@ pub fn file_find_tool() -> Tool {
             let mut targets: Vec<FindTarget> = Vec::new();
             let mut missing_paths: Vec<String> = Vec::new();
             for raw in &raw_patterns {
+                if raw.starts_with("session://") {
+                    return Err(crate::error::ToolError::other(
+                        "find 不支持 session URI；排查当前会话内容请使用 read/search 的 session://current + diagnostic=true",
+                    ));
+                }
                 let t = parse_find_pattern(raw);
                 let resolved = if t.search_path.is_absolute() {
                     t.search_path.clone()
                 } else {
                     cwd.join(&t.search_path)
                 };
+                if is_protected_runtime_path(&resolved).await {
+                    return Err(runtime_path_error(&resolved));
+                }
                 if !resolved.exists() {
                     if is_single {
                         return Err(crate::error::ToolError::other(format!(
@@ -862,5 +876,20 @@ mod tests {
             files,
             vec!["newer.txt".to_string(), "older.txt".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn find_rejects_runtime_roots_and_session_uri() {
+        let dir = build_tree();
+        let sessions = dir.path().join(".latte/ui-sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("s.jsonl"), "runtime").unwrap();
+        for path in [".latte", ".latte/ui-sessions", "session://current"] {
+            let err = run_in(dir.path().to_path_buf(), json!({"paths": [path], "hidden": true}))
+                .await.expect_err("runtime target must fail closed");
+            let msg = err.to_string();
+            assert!(msg.contains("不可直接访问") || msg.contains("find 不支持 session URI"),
+                "path={path}, error={msg}");
+        }
     }
 }

@@ -53,6 +53,10 @@ fn optional(props: Vec<(&str, PropertyType, &str)>) -> ToolInputSchema {
     }
 }
 
+pub(crate) const CURRENT_SESSION_URI: &str = "session://current";
+const CURRENT_SESSION_METADATA_KEY: &str = "current_session_file";
+const PROTECTED_LATTE_DIRS: &[&str] = &["ui-sessions", "sessions", "workflow-runs"];
+
 fn resolve_tool_path(path: &str, ctx: &ToolExecutionContext) -> PathBuf {
     let path_buf = PathBuf::from(path);
     if path_buf.is_absolute() {
@@ -64,6 +68,61 @@ fn resolve_tool_path(path: &str, ctx: &ToolExecutionContext) -> PathBuf {
         .and_then(|v| v.as_str())
         .map(|cwd| PathBuf::from(cwd).join(&path_buf))
         .unwrap_or(path_buf)
+}
+
+/// Resolve the only supported runtime-data capability. The runner supplies
+/// this path; tool input never selects a session id or a "latest" file.
+pub(crate) fn current_session_path(ctx: &ToolExecutionContext) -> Result<PathBuf, ToolError> {
+    ctx.metadata
+        .as_ref()
+        .and_then(|m| m.get(CURRENT_SESSION_METADATA_KEY))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| ToolError::other(
+            "当前执行环境没有绑定可诊断的 session 文件；不会扫描 .latte 或按时间猜测",
+        ))
+}
+
+fn has_protected_latte_components(path: &Path) -> bool {
+    let parts: Vec<String> = path.components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts.last().map_or(false, |part| part == ".latte")
+        || parts.windows(2).any(|w| {
+            w[0] == ".latte" && PROTECTED_LATTE_DIRS.iter().any(|name| w[1] == *name)
+        })
+}
+
+/// Canonicalization closes symlink aliases into protected runtime roots;
+/// lexical inspection still protects missing paths and broken links.
+pub(crate) async fn is_protected_runtime_path(path: &Path) -> bool {
+    if has_protected_latte_components(path) {
+        return true;
+    }
+    match fs::canonicalize(path).await {
+        Ok(real) => has_protected_latte_components(&real),
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn runtime_path_error(path: &Path) -> ToolError {
+    ToolError::other(format!(
+        "系统运行时内部路径（{}）不可直接访问；用户明确要求排障时请使用 session://current 并设置 diagnostic=true",
+        path.display()
+    ))
+}
+
+/// Blocking variant for walkdir/glob loops that already run off the async
+/// runtime. It is intentionally used only for explicit roots or symlinks.
+pub(crate) fn is_protected_runtime_path_blocking(path: &Path) -> bool {
+    if has_protected_latte_components(path) {
+        return true;
+    }
+    match std::fs::canonicalize(path) {
+        Ok(real) => has_protected_latte_components(&real),
+        Err(_) => false,
+    }
 }
 
 /// 从执行上下文中取 cwd（调用方通过 metadata["cwd"] 提供）。
@@ -454,24 +513,6 @@ fn summary_footer(read_path: &str, elided: &[ElidedRange], unit: &str) -> String
 async fn read_file_sel(path_buf: &std::path::Path, selector: Option<&str>, max_size: u64) -> Result<Value, ToolError> {
     let meta = fs::metadata(path_buf).await.map_err(|e| ToolError::execution_str("read", format!("stat: {}", e)))?;
     if !meta.is_file() { return Err(ToolError::other(format!("Not a file: {}", path_buf.display()))); }
-    // 运行时内部目录硬禁读：会话日志 / workflow checkpoint 是系统
-    // 自产物，agent 读它们只会自污染上下文（实际事故：agent 反复读
-    // 自己会话的实时日志，越读越大，14 连失败）。
-    {
-        let parts: Vec<String> = path_buf
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
-        let blocked = parts.windows(2).any(|w| {
-            w[0] == ".latte" && (w[1] == "ui-sessions" || w[1] == "workflow-runs")
-        });
-        if blocked {
-            return Err(ToolError::other(format!(
-                "系统运行时内部文件（{}），对 agent 不可读；如需排查运行状态请告知用户",
-                path_buf.display()
-            )));
-        }
-    }
     let bytes = fs::read(path_buf).await.map_err(|e| ToolError::execution_str("read", format!("read: {}", e)))?;
     let total_bytes = bytes.len() as u64;
     let content = String::from_utf8_lossy(&bytes).to_string();
@@ -572,8 +613,27 @@ pub fn file_read_tool() -> Tool {
             let path = input.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
                 ToolError::other("path is required")
             })?;
+            let diagnostic = input.get("diagnostic").and_then(|v| v.as_bool()).unwrap_or(false);
             let (file_path, selector) = parse_path_selector(path);
-            let path_buf = resolve_tool_path(file_path, &ctx);
+            let is_current_session = file_path == CURRENT_SESSION_URI;
+            if file_path.starts_with("session://") && !is_current_session {
+                return Err(ToolError::other(format!(
+                    "不支持的内部 URI：{file_path}；只支持 session://current"
+                )));
+            }
+            let path_buf = if is_current_session {
+                if !diagnostic {
+                    return Err(ToolError::other(
+                        "读取 session://current 仅用于用户明确要求的运行时排障；请设置 diagnostic=true",
+                    ));
+                }
+                current_session_path(&ctx)?
+            } else {
+                resolve_tool_path(file_path, &ctx)
+            };
+            if !is_current_session && is_protected_runtime_path(&path_buf).await {
+                return Err(runtime_path_error(&path_buf));
+            }
             let meta = fs::metadata(&path_buf)
                 .await
                 .map_err(|e| stat_error("read", &path_buf, &ctx, &e))?;
@@ -598,13 +658,20 @@ pub fn file_read_tool() -> Tool {
             "返回内容上限（字节），默认 10MB（10485760），超出截断返回（truncated=true），不报错。",
         ),
     );
+    props.insert(
+        "diagnostic".to_string(),
+        prop(
+            PropertyType::Boolean,
+            "仅当用户明确要求排查当前运行状态时设 true；配合 path=session://current 读取runner精确绑定的已持久化session transcript。",
+        ),
+    );
     let schema = ToolInputSchema {
         schema_type: Default::default(),
         properties: props,
         required: Some(vec!["path".to_string()]),
         additional_properties: None,
     };
-    Tool::builder("read", "读取文件内容。支持行范围选择器：path:start-end、path:start+count、path:raw；读代码文件且不带行范围时默认回传【结构摘要】：只列顶层定义的签名+行号、折叠函数体，末尾 footer 告诉你要看实现该重读哪几行；要整文件原文用 path:raw。maxSize 是返回内容上限（默认 10MB），超出截断并在 truncated/note 字段说明，不会报错。也支持读取目录列表。注意：.latte/ 是系统运行时内部目录（会话日志、workflow checkpoint、任务看板数据），不要读取，除非用户明确要求。", schema, std::sync::Arc::new(handler))
+    Tool::builder("read", "读取文件内容。支持行范围选择器：path:start-end、path:start+count、path:raw；读代码文件且不带行范围时默认回传【结构摘要】：只列顶层定义的签名+行号、折叠函数体，末尾 footer 告诉你要看实现该重读哪几行；要整文件原文用 path:raw。maxSize 是返回内容上限（默认 10MB），超出截断并在 truncated/note 字段说明，不会报错。也支持读取目录列表。系统运行时session/checkpoint的物理路径始终拒绝；仅当用户明确要求排障时可用 path=session://current + diagnostic=true 读取runner精确绑定的已持久化当前session，不扫描目录、不按mtime猜测。", schema, std::sync::Arc::new(handler))
         .concurrency_safe(true)
         .strict(true)
         .timeout(std::time::Duration::from_secs(30))
@@ -1148,6 +1215,71 @@ mod tests {
             .execute("read", json!({"path": p}), None)
             .await
             .expect_err("运行时内部文件必须被拒绝");
-        assert!(err.to_string().contains("系统运行时内部文件"), "{err}");
+        assert!(err.to_string().contains("系统运行时内部路径"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn current_session_requires_diagnostic_and_bound_capability() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".latte/ui-sessions/current.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        fs::write(&path, "one\ntwo\nthree\n").await.unwrap();
+        let m = create_tool_manager();
+        m.register_package(FileToolsPackage::new()).await.unwrap();
+        let mut ctx = crate::types::ToolExecutionContext::fresh("read", 0);
+        ctx.metadata = Some(json!({"cwd": dir.path(), "current_session_file": path}));
+
+        let err = m.execute("read", json!({"path": CURRENT_SESSION_URI}), Some(ctx.clone()))
+            .await.expect_err("diagnostic gate must be explicit");
+        assert!(err.to_string().contains("diagnostic=true"), "{err}");
+        let out = m.execute("read", json!({
+            "path": "session://current:2-3", "diagnostic": true
+        }), Some(ctx)).await.unwrap();
+        assert_eq!(out["content"], "two\nthree");
+
+        let err = m.execute("read", json!({
+            "path": CURRENT_SESSION_URI, "diagnostic": true
+        }), None).await.expect_err("missing capability must fail closed");
+        assert!(err.to_string().contains("不会扫描 .latte"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn current_session_capability_isolated_between_contexts() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join(".latte/ui-sessions");
+        fs::create_dir_all(&root).await.unwrap();
+        let a = root.join("a.jsonl");
+        let b = root.join("b.jsonl");
+        fs::write(&a, "SESSION_A_ONLY\n").await.unwrap();
+        fs::write(&b, "SESSION_B_ONLY\n").await.unwrap();
+        let m = create_tool_manager();
+        m.register_package(FileToolsPackage::new()).await.unwrap();
+        let mut ctx_a = crate::types::ToolExecutionContext::fresh("read", 0);
+        ctx_a.metadata = Some(json!({"cwd": dir.path(), "current_session_file": a}));
+        let mut ctx_b = crate::types::ToolExecutionContext::fresh("read", 0);
+        ctx_b.metadata = Some(json!({"cwd": dir.path(), "current_session_file": b}));
+        let input = json!({"path": CURRENT_SESSION_URI, "diagnostic": true});
+        let (a, b) = tokio::join!(
+            m.execute("read", input.clone(), Some(ctx_a)),
+            m.execute("read", input, Some(ctx_b)),
+        );
+        assert_eq!(a.unwrap()["content"], "SESSION_A_ONLY\n");
+        assert_eq!(b.unwrap()["content"], "SESSION_B_ONLY\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_symlink_cannot_bypass_runtime_protection() {
+        let dir = TempDir::new().unwrap();
+        let session = dir.path().join(".latte/ui-sessions/s.jsonl");
+        fs::create_dir_all(session.parent().unwrap()).await.unwrap();
+        fs::write(&session, "secret").await.unwrap();
+        let link = dir.path().join("apparently-safe.jsonl");
+        std::os::unix::fs::symlink(&session, &link).unwrap();
+        let m = create_tool_manager();
+        m.register_package(FileToolsPackage::new()).await.unwrap();
+        let err = m.execute("read", json!({"path": link}), None).await
+            .expect_err("canonical target must remain protected");
+        assert!(err.to_string().contains("系统运行时内部路径"), "{err}");
     }
 }
